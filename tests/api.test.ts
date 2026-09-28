@@ -101,6 +101,13 @@ test('login, password change, graph edits and optimistic conflicts', async () =>
   assert.equal(graphAfterBulkNotes.data.nodes.some((node: { noteId: string }) => node.noteId === batchFirst.data.note.id), false);
   assert.equal(graphAfterBulkNotes.data.nodes.some((node: { noteId: string }) => node.noteId === batchSecond.data.note.id), false);
 
+  const deleteAllFirst = await call(`/boards/${boardId}/notes`, 'POST', { title: '전체 삭제 첫 메모', position: { x: 48, y: 9, z: 10 } });
+  const deleteAllSecond = await call(`/boards/${boardId}/notes`, 'POST', { title: '전체 삭제 둘째 메모', position: { x: 58, y: 9, z: 10 } });
+  const deletedAllNotes = await call(`/boards/${boardId}/notes`, 'DELETE', { all: true, excludedNoteIds: [noteId, deleteAllSecond.data.note.id] });
+  assert.equal(deletedAllNotes.status, 200);
+  assert.equal((await call(`/notes/${deleteAllFirst.data.note.id}`)).status, 404);
+  assert.equal((await call(`/notes/${deleteAllSecond.data.note.id}`)).status, 200);
+
   const disposableBoard = await call('/boards', 'POST', { title: '일괄 삭제 테스트 공간' });
   assert.equal(disposableBoard.status, 201);
   const disposableBoardId = disposableBoard.data.board.id as string;

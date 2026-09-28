@@ -47,8 +47,8 @@ function object(value: unknown): Record<string, unknown> {
 function oid(value: unknown): ObjectId | null {
   return typeof value === 'string' && ObjectId.isValid(value) ? new ObjectId(value) : null;
 }
-function objectIds(value: unknown, max = 2_000): ObjectId[] | null {
-  if (!Array.isArray(value) || value.length < 1 || value.length > max) return null;
+function objectIds(value: unknown, max = 2_000, allowEmpty = false): ObjectId[] | null {
+  if (!Array.isArray(value) || value.length < (allowEmpty ? 0 : 1) || value.length > max) return null;
   const ids = new Map<string, ObjectId>();
   for (const valueId of value) {
     const id = oid(valueId);
@@ -268,19 +268,23 @@ app.delete('/api/boards/:id/notes', async (request, reply) => {
   if (!user) return;
   const board = await ownedBoard(params(request).id, user, reply);
   if (!board) return;
-  const noteIds = objectIds(object(request.body).noteIds);
-  if (!noteIds) return reply.code(400).send({ error: '삭제할 메모를 선택해 주세요.' });
-  const foundNotes = await notes.find({ _id: { $in: noteIds }, boardId: board._id }, { projection: { _id: 1 } }).toArray();
-  if (foundNotes.length !== noteIds.length) return reply.code(404).send({ error: '삭제할 메모를 찾을 수 없습니다.' });
-  const nodeDocs = await nodes.find({ boardId: board._id, noteId: { $in: noteIds } }, { projection: { _id: 1 } }).toArray();
+  const input = object(request.body);
+  const deleteAll = input.all === true;
+  const selectedIds = deleteAll ? objectIds(input.excludedNoteIds ?? [], 2_000, true) : objectIds(input.noteIds);
+  if (!selectedIds) return reply.code(400).send({ error: '삭제할 메모를 선택해 주세요.' });
+  const noteFilter = deleteAll ? { boardId: board._id, _id: { $nin: selectedIds } } : { boardId: board._id, _id: { $in: selectedIds } };
+  const foundNotes = await notes.find(noteFilter, { projection: { _id: 1 } }).toArray();
+  if (!deleteAll && foundNotes.length !== selectedIds.length) return reply.code(404).send({ error: '삭제할 메모를 찾을 수 없습니다.' });
+  const noteIds = foundNotes.map(note => note._id);
+  const nodeDocs = noteIds.length ? await nodes.find({ boardId: board._id, noteId: { $in: noteIds } }, { projection: { _id: 1 } }).toArray() : [];
   const nodeIds = nodeDocs.map(node => node._id);
   await Promise.all([
     nodeIds.length ? edges.deleteMany({ boardId: board._id, $or: [{ sourceNodeId: { $in: nodeIds } }, { targetNodeId: { $in: nodeIds } }] }) : Promise.resolve(),
-    nodes.deleteMany({ boardId: board._id, noteId: { $in: noteIds } }),
-    notes.deleteMany({ _id: { $in: noteIds }, boardId: board._id }),
+    noteIds.length ? nodes.deleteMany({ boardId: board._id, noteId: { $in: noteIds } }) : Promise.resolve(),
+    noteIds.length ? notes.deleteMany({ _id: { $in: noteIds }, boardId: board._id }) : Promise.resolve(),
   ]);
   await boards.updateOne({ _id: board._id }, { $set: { updatedAt: new Date() }, $inc: { revision: 1 } });
-  return { ok: true, deletedNoteIds: foundNotes.map(note => note._id.toHexString()), deletedCount: foundNotes.length };
+  return { ok: true, deletedNoteIds: deleteAll ? [] : foundNotes.map(note => note._id.toHexString()), deletedCount: foundNotes.length };
 });
 app.get('/api/notes/:id', async (request, reply) => {
   const user = await requireUser(request, reply);
