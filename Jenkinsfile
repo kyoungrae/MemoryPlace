@@ -7,7 +7,7 @@ pipeline {
     buildDiscarder(logRotator(numToKeepStr: '20'))
   }
   parameters {
-    booleanParam(name: 'DEPLOY_AFTER_BUILD', defaultValue: true, description: 'Deploy the successful build to MemoryPlace')
+    booleanParam(name: 'DEPLOY_AFTER_BUILD', defaultValue: false, description: 'Deploy the successful build to MemoryPlace')
   }
   stages {
     stage('Source') {

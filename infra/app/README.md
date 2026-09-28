@@ -11,7 +11,7 @@ Jenkins 작업은 이 저장소의 `Jenkinsfile` 내용을 **Pipeline script**�
 1. `Dockerfile`의 `build` 단계를 빌드해 TypeScript 검사와 웹 번들링을 실행한다.
 2. 일회용 MongoDB와 네트워크를 만들어 API 통합 테스트를 실행한 뒤 정리한다.
 3. 운영 이미지를 빌드한다.
-4. `DEPLOY_AFTER_BUILD`가 켜져 있으면 [배포 스크립트](../../scripts/deploy.sh)로 앱 컨테이너를 교체하고 Docker 상태 검사가 통과했는지 확인한다. 실패 시 직전 이미지를 복원한다.
+4. `DEPLOY_AFTER_BUILD`를 명시적으로 켜면 [배포 스크립트](../../scripts/deploy.sh)로 앱 컨테이너를 교체하고 Docker 상태 검사가 통과했는지 확인한다. 실패 시 직전 이미지를 복원한다. 기본값은 빌드만 실행이다.
 
 배포 스크립트는 `memoryplace_default` 네트워크와 `memoryplace_app_secrets` 볼륨이 존재해야 실행된다. 이 이름은 기존 MongoDB 배포와 맞춘 것이므로 다른 Docker 환경에서는 스크립트를 수정한다. 앱 설정은 Docker 읽기 전용 볼륨에서 공급하며 이미지에는 포함되지 않는다.
 
