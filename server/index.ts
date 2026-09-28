@@ -3,12 +3,13 @@ import cookie from '@fastify/cookie';
 import fastifyStatic from '@fastify/static';
 import argon2 from 'argon2';
 import { createHash, randomBytes } from 'node:crypto';
-import { existsSync } from 'node:fs';
+import { existsSync, readFileSync } from 'node:fs';
 import { loadEnvFile } from 'node:process';
 import { resolve } from 'node:path';
 import { MongoClient, ObjectId, type Db } from 'mongodb';
 import type { Board, CameraState, Graph, GraphEdge, GraphNode, Note, User, Vec3 } from '../shared/types.js';
 
+if (!process.env.MONGO_URL && process.env.MONGO_URL_FILE) process.env.MONGO_URL = readFileSync(process.env.MONGO_URL_FILE, 'utf8').trim();
 if (!process.env.MONGO_URL && existsSync('.env.local')) loadEnvFile('.env.local');
 const mongoUrl = process.env.MONGO_URL;
 if (!mongoUrl) throw new Error('MONGO_URL is required. See README.md.');
