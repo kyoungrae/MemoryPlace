@@ -30,11 +30,13 @@ class NeuronEngine {
   private raycaster = new THREE.Raycaster();
   private nodeMesh: THREE.InstancedMesh | null = null;
   private haloMesh: THREE.InstancedMesh | null = null;
-  private lineMesh: THREE.LineSegments | null = null;
+  private lineMesh: THREE.Mesh<THREE.InstancedBufferGeometry, THREE.ShaderMaterial> | null = null;
+  private lineMaterial: THREE.ShaderMaterial | null = null;
   private stars: THREE.Points;
   private items: Item[] = [];
   private itemById = new Map<string, number>();
-  private lineEndpoints = new Map<string, number[]>();
+  private lineEndpoints = new Map<string, { index: number; endpoint: 'start' | 'end' }[]>();
+  private linePairs: { sourceId: string; targetId: string }[] = [];
   private nodes = new Map<string, GraphNode>();
   private graph: Graph;
   private selectedId: string | null = null;
@@ -102,7 +104,7 @@ class NeuronEngine {
   setCallbacks(callbacks: NeuronEngine['callbacks']) { this.callbacks = callbacks; }
   setLinking(linking: boolean) { this.linking = linking; }
   setSelected(id: string | null) {
-    this.selectedId = id; this.refreshColors(); this.invalidate();
+    this.selectedId = id; this.refreshColors(); this.refreshLineColors(); this.invalidate();
     if (id) this.reportAnchor(id);
   }
   private reportAnchor(id: string) {
@@ -163,10 +165,12 @@ class NeuronEngine {
   }
 
   private disposeGraph() {
-    for (const mesh of [this.nodeMesh, this.haloMesh, this.lineMesh]) {
+    for (const mesh of [this.nodeMesh, this.haloMesh]) {
       if (mesh) { this.scene.remove(mesh); mesh.geometry.dispose(); (mesh.material as THREE.Material).dispose(); }
     }
+    if (this.lineMesh) { this.scene.remove(this.lineMesh); this.lineMesh.geometry.dispose(); }
     this.nodeMesh = null; this.haloMesh = null; this.lineMesh = null;
+    this.lineEndpoints.clear(); this.linePairs = [];
   }
 
   private buildGeometry() {
@@ -246,10 +250,10 @@ class NeuronEngine {
     if (this.lineMesh) {
       this.scene.remove(this.lineMesh);
       this.lineMesh.geometry.dispose();
-      (this.lineMesh.material as THREE.Material).dispose();
       this.lineMesh = null;
     }
     this.lineEndpoints.clear();
+    this.linePairs = [];
     const groupByNode = new Map<string, string>();
     const size = clamp(this.state.distance / 4, 18, 45);
     for (const node of this.nodes.values()) {
@@ -257,7 +261,7 @@ class NeuronEngine {
       groupByNode.set(node.id, this.itemById.has(key) ? key : node.id);
     }
     const seen = new Set<string>();
-    const positions: number[] = [], colors: number[] = [];
+    const starts: number[] = [], ends: number[] = [], colors: number[] = [];
     for (const edge of this.graph.edges) {
       const aId = groupByNode.get(edge.sourceNodeId), bId = groupByNode.get(edge.targetNodeId);
       if (!aId || !bId || aId === bId) continue;
@@ -265,20 +269,113 @@ class NeuronEngine {
       if (seen.has(key)) continue;
       seen.add(key);
       const a = this.items[this.itemById.get(aId)!].position, b = this.items[this.itemById.get(bId)!].position;
-      const vertexIndex = positions.length / 3;
-      positions.push(a.x, a.y, a.z, b.x, b.y, b.z);
-      if (aId === edge.sourceNodeId) this.lineEndpoints.set(aId, [...(this.lineEndpoints.get(aId) ?? []), vertexIndex]);
-      if (bId === edge.targetNodeId) this.lineEndpoints.set(bId, [...(this.lineEndpoints.get(bId) ?? []), vertexIndex + 1]);
+      const index = starts.length / 3;
+      starts.push(a.x, a.y, a.z);
+      ends.push(b.x, b.y, b.z);
+      if (aId === edge.sourceNodeId) {
+        const endpoints = this.lineEndpoints.get(aId) ?? [];
+        endpoints.push({ index, endpoint: 'start' });
+        this.lineEndpoints.set(aId, endpoints);
+      }
+      if (bId === edge.targetNodeId) {
+        const endpoints = this.lineEndpoints.get(bId) ?? [];
+        endpoints.push({ index, endpoint: 'end' });
+        this.lineEndpoints.set(bId, endpoints);
+      }
+      this.linePairs.push({ sourceId: edge.sourceNodeId, targetId: edge.targetNodeId });
       const focused = edge.sourceNodeId === this.selectedId || edge.targetNodeId === this.selectedId;
       const tint = focused ? [0.33, 0.92, 0.82] : [0.14, 0.29, 0.41];
-      colors.push(...tint, ...tint);
+      colors.push(...tint);
     }
-    const lineGeometry = new THREE.BufferGeometry();
-    lineGeometry.setAttribute('position', new THREE.Float32BufferAttribute(positions, 3));
-    lineGeometry.setAttribute('color', new THREE.Float32BufferAttribute(colors, 3));
-    this.lineMesh = new THREE.LineSegments(lineGeometry, new THREE.LineBasicMaterial({ vertexColors: true, transparent: true, opacity: 0.76, depthWrite: false }));
+    if (!starts.length) return;
+    const lineGeometry = new THREE.InstancedBufferGeometry();
+    lineGeometry.setIndex([0, 1, 2, 0, 2, 3]);
+    lineGeometry.setAttribute('position', new THREE.Float32BufferAttribute([
+      -0.5, -1, 0, 0.5, -1, 0, 0.5, 1, 0, -0.5, 1, 0,
+    ], 3));
+    lineGeometry.setAttribute('edgeStart', new THREE.InstancedBufferAttribute(new Float32Array(starts), 3).setUsage(THREE.DynamicDrawUsage));
+    lineGeometry.setAttribute('edgeEnd', new THREE.InstancedBufferAttribute(new Float32Array(ends), 3).setUsage(THREE.DynamicDrawUsage));
+    lineGeometry.setAttribute('edgeColor', new THREE.InstancedBufferAttribute(new Float32Array(colors), 3).setUsage(THREE.DynamicDrawUsage));
+    lineGeometry.instanceCount = starts.length / 3;
+    const rect = this.canvas.getBoundingClientRect();
+    const lineMaterial = this.lineMaterial ?? new THREE.ShaderMaterial({
+      uniforms: {
+        uResolution: { value: new THREE.Vector2(rect.width || 1, rect.height || 1) },
+        uNear: { value: this.camera.near + 0.01 },
+        uWidth: { value: 1.65 },
+      },
+      vertexShader: `
+        attribute vec3 edgeStart;
+        attribute vec3 edgeEnd;
+        attribute vec3 edgeColor;
+        uniform vec2 uResolution;
+        uniform float uNear;
+        uniform float uWidth;
+        varying float vAcross;
+        varying vec3 vColor;
+        void main() {
+          vec4 a = modelViewMatrix * vec4(edgeStart, 1.0);
+          vec4 b = modelViewMatrix * vec4(edgeEnd, 1.0);
+          float nearZ = -uNear;
+          if (a.z > nearZ && b.z > nearZ) {
+            gl_Position = vec4(2.0, 2.0, 2.0, 1.0);
+            vAcross = 0.0;
+            vColor = edgeColor;
+            return;
+          }
+          if (a.z > nearZ) a = mix(a, b, clamp((nearZ - a.z) / (b.z - a.z), 0.0, 1.0));
+          if (b.z > nearZ) b = mix(b, a, clamp((nearZ - b.z) / (a.z - b.z), 0.0, 1.0));
+          vec4 clipA = projectionMatrix * a;
+          vec4 clipB = projectionMatrix * b;
+          vec2 startPx = (clipA.xy / clipA.w + 1.0) * 0.5 * uResolution;
+          vec2 endPx = (clipB.xy / clipB.w + 1.0) * 0.5 * uResolution;
+          vec2 delta = endPx - startPx;
+          vec2 tangent = delta / max(length(delta), 0.0001);
+          vec2 normal = vec2(-tangent.y, tangent.x);
+          float t = position.x + 0.5;
+          float halfExtent = uWidth * 0.5 + 1.0;
+          vec2 pixel = mix(startPx, endPx, t) + normal * position.y * halfExtent;
+          vec2 ndc = pixel * 2.0 / uResolution - 1.0;
+          float depth = mix(clipA.z / clipA.w, clipB.z / clipB.w, t);
+          gl_Position = vec4(ndc, depth, 1.0);
+          vAcross = position.y * halfExtent;
+          vColor = edgeColor;
+        }
+      `,
+      fragmentShader: `
+        uniform float uWidth;
+        varying float vAcross;
+        varying vec3 vColor;
+        void main() {
+          float halfWidth = uWidth * 0.5;
+          float smoothEdge = max(fwidth(vAcross), 0.45);
+          float alpha = 1.0 - smoothstep(halfWidth - smoothEdge, halfWidth + smoothEdge, abs(vAcross));
+          if (alpha < 0.001) discard;
+          gl_FragColor = vec4(vColor, alpha * 0.76);
+          #include <tonemapping_fragment>
+          #include <colorspace_fragment>
+        }
+      `,
+      transparent: true,
+      depthWrite: false,
+      side: THREE.DoubleSide,
+    });
+    this.lineMaterial = lineMaterial;
+    lineMaterial.uniforms.uResolution.value.set(rect.width || 1, rect.height || 1);
+    this.lineMesh = new THREE.Mesh(lineGeometry, lineMaterial);
     this.lineMesh.frustumCulled = false;
+    this.lineMesh.renderOrder = 1;
     this.scene.add(this.lineMesh);
+  }
+
+  private refreshLineColors() {
+    if (!this.lineMesh) return;
+    const colors = this.lineMesh.geometry.getAttribute('edgeColor') as THREE.InstancedBufferAttribute;
+    this.linePairs.forEach((edge, index) => {
+      const focused = edge.sourceId === this.selectedId || edge.targetId === this.selectedId;
+      colors.setXYZ(index, focused ? 0.33 : 0.14, focused ? 0.92 : 0.29, focused ? 0.82 : 0.41);
+    });
+    colors.needsUpdate = true;
   }
 
   private writeMatrix(index: number, item: Item) {
@@ -313,9 +410,18 @@ class NeuronEngine {
       if (this.haloMesh) this.haloMesh.instanceMatrix.needsUpdate = true;
     }
     if (this.lineMesh && this.lineEndpoints.has(id)) {
-      const positions = this.lineMesh.geometry.getAttribute('position') as THREE.BufferAttribute;
-      for (const vertexIndex of this.lineEndpoints.get(id)!) positions.setXYZ(vertexIndex, node.x, node.y, node.z);
-      positions.needsUpdate = true;
+      const starts = this.lineMesh.geometry.getAttribute('edgeStart') as THREE.InstancedBufferAttribute;
+      const ends = this.lineMesh.geometry.getAttribute('edgeEnd') as THREE.InstancedBufferAttribute;
+      let movedStart = false, movedEnd = false;
+      for (const { index, endpoint } of this.lineEndpoints.get(id)!) {
+        const attribute = endpoint === 'start' ? starts : ends;
+        attribute.setXYZ(index, node.x, node.y, node.z);
+        attribute.addUpdateRange(index * 3, 3);
+        if (endpoint === 'start') movedStart = true;
+        else movedEnd = true;
+      }
+      if (movedStart) starts.needsUpdate = true;
+      if (movedEnd) ends.needsUpdate = true;
     }
     this.invalidate();
   }
@@ -328,6 +434,7 @@ class NeuronEngine {
     this.renderer.setSize(rect.width, rect.height, false);
     this.camera.aspect = rect.width / rect.height;
     this.camera.updateProjectionMatrix();
+    if (this.lineMesh) this.lineMesh.material.uniforms.uResolution.value.set(rect.width, rect.height);
     this.labels.width = Math.round(rect.width * ratio);
     this.labels.height = Math.round(rect.height * ratio);
     this.labels.style.width = `${rect.width}px`;
@@ -452,6 +559,7 @@ class NeuronEngine {
       this.mode = 'drag';
       this.selectedId = hit.id;
       this.refreshColors();
+      this.refreshLineColors();
       this.callbacks.onSelect(hit.id, anchor);
       this.dragPlane.setFromNormalAndCoplanarPoint(this.camera.getWorldDirection(new THREE.Vector3()), vector(hit.position));
       const point = this.pointOnPlane(event.clientX, event.clientY);
@@ -603,6 +711,8 @@ class NeuronEngine {
     window.removeEventListener('keyup', this.onKeyUp);
     window.removeEventListener('blur', this.onWindowBlur);
     this.disposeGraph();
+    this.lineMaterial?.dispose();
+    this.lineMaterial = null;
     this.stars.geometry.dispose();
     (this.stars.material as THREE.Material).dispose();
     this.renderer.dispose();
