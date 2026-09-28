@@ -1,0 +1,23 @@
+name: memoryplace
+
+services:
+  mongo:
+    image: mongo:8.0
+    container_name: memoryplace-mongo
+    restart: unless-stopped
+    environment:
+      MONGO_INITDB_ROOT_USERNAME: memoryplace_root
+      MONGO_INITDB_ROOT_PASSWORD_FILE: /run/secrets/mongo_root_password
+    ports:
+      - "127.0.0.1:27019:27017"
+    volumes:
+      - mongo_data:/data/db
+    secrets:
+      - mongo_root_password
+
+secrets:
+  mongo_root_password:
+    file: ${MEMORYPLACE_SECRET_DIR:?Set MEMORYPLACE_SECRET_DIR}/mongo_root_password
+
+volumes:
+  mongo_data:
