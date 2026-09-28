@@ -1,11 +1,13 @@
-import { lazy, Suspense, useCallback, useEffect, useMemo, useRef, useState } from 'react';
-import type { Board, CameraState, Graph, GraphNode, Note, User } from '../shared/types';
+import { lazy, Suspense, useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from 'react';
+import type { Board, CameraState, Graph, GraphEdge, GraphNode, Note, User } from '../shared/types';
 import { ApiError, authApi, boardApi, noteApi } from './api';
 
 const NeuronCanvas = lazy(() => import('./NeuronCanvas').then(module => ({ default: module.NeuronCanvas })));
 
 type SaveStatus = 'saved' | 'dirty' | 'saving' | 'offline' | 'conflict';
 type SearchResult = { noteId: string; nodeId?: string; title: string };
+type Anchor = { x: number; y: number };
+type PanelState = { nodeId: string; anchor: Anchor; phase: 'opening' | 'closing' };
 
 const statusLabel: Record<SaveStatus, string> = { saved: '모든 변경사항 저장됨', dirty: '저장 대기 중', saving: '저장 중…', offline: '연결 대기 중 · 기기에 임시 보관', conflict: '다른 변경 내용과 충돌' };
 
@@ -56,6 +58,7 @@ export function App() {
   const [graph, setGraph] = useState<Graph | null>(null);
   const graphRef = useRef<Graph | null>(null);
   const [selectedId, setSelectedId] = useState<string | null>(null);
+  const [panel, setPanel] = useState<PanelState | null>(null);
   const [note, setNote] = useState<Note | null>(null);
   const noteRef = useRef<Note | null>(null);
   const [mode, setMode] = useState<'neuron' | 'page'>('neuron');
@@ -72,6 +75,8 @@ export function App() {
   const saveTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
   const cameraTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
   const scaleTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const panelTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const panelRef = useRef<HTMLDivElement>(null);
   const saving = useRef(false);
   const noteRequest = useRef(0);
   const pendingMoves = useRef(new Map<string, GraphNode>());
@@ -80,6 +85,19 @@ export function App() {
 
   useEffect(() => { graphRef.current = graph; }, [graph]);
   useEffect(() => { noteRef.current = note; }, [note]);
+  useLayoutEffect(() => {
+    if (!panel || !panelRef.current) return;
+    const element = panelRef.current;
+    const parentRect = element.offsetParent?.getBoundingClientRect();
+    if (!parentRect) return;
+    const dx = panel.anchor.x - parentRect.left - element.offsetLeft - element.offsetWidth / 2;
+    const dy = panel.anchor.y - parentRect.top - element.offsetTop - element.offsetHeight / 2;
+    panelRef.current.style.setProperty('--genie-x', `${dx}px`);
+    panelRef.current.style.setProperty('--genie-y', `${dy}px`);
+    panelRef.current.style.setProperty('--genie-mid-x', `${dx * 0.36}px`);
+    panelRef.current.style.setProperty('--genie-mid-y', `${dy * 0.36}px`);
+  }, [panel]);
+  useEffect(() => () => { if (panelTimer.current) clearTimeout(panelTimer.current); }, []);
   useEffect(() => { authApi.me().then(result => setUser(result.user)).catch(() => {}).finally(() => setBooting(false)); }, []);
   useEffect(() => {
     const worker = new Worker(new URL('./layout.worker.ts', import.meta.url), { type: 'module' });
@@ -102,7 +120,8 @@ export function App() {
       void saveDraft();
       noteRef.current = null;
     }
-    setGraph(null); setSelectedId(null); setNote(null); setMode('neuron'); setLoadingGraph(true);
+    if (panelTimer.current) clearTimeout(panelTimer.current);
+    setGraph(null); setSelectedId(null); setPanel(null); setNote(null); setMode('neuron'); setLoadingGraph(true);
     localStorage.setItem('memoryplace:board', boardId);
     boardApi.graph(boardId).then(result => { if (!cancelled) setGraph(result); }).catch(cause => { if (!cancelled) setError(cause instanceof Error ? cause.message : '그래프를 불러오지 못했습니다.'); }).finally(() => { if (!cancelled) setLoadingGraph(false); });
     return () => { cancelled = true; };
@@ -121,6 +140,7 @@ export function App() {
   const saveDraft = useCallback(async () => {
     const snapshot = noteRef.current;
     if (!snapshot) return;
+    if (!snapshot.title.trim()) { setSaveStatus('dirty'); return; }
     if (saving.current) {
       if (saveTimer.current) clearTimeout(saveTimer.current);
       saveTimer.current = setTimeout(() => void saveDraft(), 500);
@@ -139,7 +159,7 @@ export function App() {
           if (saveTimer.current) clearTimeout(saveTimer.current);
           saveTimer.current = setTimeout(() => void saveDraft(), 500);
         } else localStorage.removeItem(`memoryplace:draft:${snapshot.id}`);
-        setGraph(previous => previous ? { ...previous, nodes: previous.nodes.map(node => node.noteId === snapshot.id ? { ...node, title: result.note.title } : node) } : previous);
+        setGraph(previous => previous ? { ...previous, nodes: previous.nodes.map(node => node.noteId === snapshot.id ? { ...node, title: changedSince ? current.title : result.note.title } : node) } : previous);
       } else localStorage.removeItem(`memoryplace:draft:${snapshot.id}`);
     } catch (cause) {
       if (noteRef.current?.id === snapshot.id) {
@@ -154,6 +174,7 @@ export function App() {
     if (!current) return;
     const next = { ...current, ...patch };
     noteRef.current = next; setNote(next); setSaveStatus('dirty');
+    if (patch.title !== undefined) setGraph(previous => previous ? { ...previous, nodes: previous.nodes.map(node => node.noteId === next.id ? { ...node, title: next.title || '제목 없음' } : node) } : previous);
     localStorage.setItem(`memoryplace:draft:${next.id}`, JSON.stringify({ title: next.title, body: next.body }));
     if (saveTimer.current) clearTimeout(saveTimer.current);
     saveTimer.current = setTimeout(() => void saveDraft(), 650);
@@ -187,15 +208,39 @@ export function App() {
     return { ...previous, nodes: [...nodes.values()], edges: [...edges.values()], hasMore: part.hasMore, totalNodes: part.totalNodes };
   });
 
-  const selectNode = async (nodeId: string, open = false) => {
+  const showPanel = (nodeId: string, anchor?: Anchor) => {
+    if (panelTimer.current) clearTimeout(panelTimer.current);
+    setPanel(current => mode !== 'neuron' ? null : anchor ? { nodeId, anchor, phase: 'opening' } : current?.nodeId === nodeId ? { ...current, phase: 'opening' } : null);
+  };
+  const updatePanelAnchor = (nodeId: string, anchor: Anchor) => {
+    if (mode !== 'neuron' || selectedId !== nodeId) return;
+    setPanel(current => current?.phase === 'closing' ? current : current?.nodeId === nodeId ? { ...current, anchor } : { nodeId, anchor, phase: 'opening' });
+  };
+  const dismissPanel = (anchor?: Anchor | null) => {
+    if (!selectedId && !panel) return;
+    setSelectedId(null); setLinking(false);
+    setPanel(current => current ? { ...current, anchor: anchor ?? current.anchor, phase: 'closing' } : null);
+    if (panelTimer.current) clearTimeout(panelTimer.current);
+    panelTimer.current = setTimeout(() => setPanel(current => current?.phase === 'closing' ? null : current), 380);
+  };
+
+  const selectNode = async (nodeId: string, open = false, anchor?: Anchor) => {
     const current = graphRef.current;
     if (!current || !boardId) return;
     if (linking && selectedId && selectedId !== nodeId) {
+      const connected = current.edges.some(edge => edge.sourceNodeId === selectedId && edge.targetNodeId === nodeId || edge.sourceNodeId === nodeId && edge.targetNodeId === selectedId);
+      setLinking(false);
+      if (connected) return;
+      const pending: GraphEdge = { id: `pending:${crypto.randomUUID()}`, sourceNodeId: selectedId, targetNodeId: nodeId, kind: 'related' };
+      setGraph(previous => previous ? { ...previous, edges: [...previous.edges, pending] } : previous);
       try {
         const { edge } = await boardApi.link(boardId, selectedId, nodeId);
-        setGraph(previous => previous && !previous.edges.some(item => item.id === edge.id) ? { ...previous, edges: [...previous.edges, edge] } : previous);
-        setLinking(false);
-      } catch (cause) { setError(cause instanceof Error ? cause.message : '연결을 만들지 못했습니다.'); }
+        setGraph(previous => previous ? { ...previous, edges: [...previous.edges.filter(item => item.id !== pending.id && item.id !== edge.id), edge] } : previous);
+      } catch (cause) {
+        setGraph(previous => previous ? { ...previous, edges: previous.edges.filter(item => item.id !== pending.id) } : previous);
+        setLinking(true);
+        setError(cause instanceof Error ? cause.message : '연결을 만들지 못했습니다.');
+      }
       return;
     }
     let node = current.nodes.find(item => item.id === nodeId);
@@ -207,9 +252,10 @@ export function App() {
       } catch (cause) { setError(cause instanceof Error ? cause.message : '연결된 생각을 불러오지 못했습니다.'); }
     }
     if (!node) return;
+    if (open) { setPanel(null); setMode('page'); }
+    else showPanel(nodeId, anchor);
     setSelectedId(nodeId); setSidebarOpen(false);
     await loadNote(node.noteId);
-    if (open) setMode('page');
   };
 
   const flushMove = async (nodeId: string) => {
@@ -222,7 +268,9 @@ export function App() {
       setGraph(previous => previous ? { ...previous, nodes: previous.nodes.map(item => item.id === nodeId ? { ...item, revision: result.node.revision } : item) } : previous);
       const pending = pendingMoves.current.get(nodeId);
       if (pending) pending.revision = result.node.revision;
-    } catch (cause) { setError(cause instanceof Error ? cause.message : '노드 위치를 저장하지 못했습니다.'); }
+    } catch (cause) {
+      if (!(cause instanceof ApiError && cause.status === 404)) setError(cause instanceof Error ? cause.message : '노드 위치를 저장하지 못했습니다.');
+    }
     finally { activeMoves.current.delete(nodeId); if (pendingMoves.current.has(nodeId)) void flushMove(nodeId); }
   };
   const commitNode = (node: GraphNode) => {
@@ -243,9 +291,11 @@ export function App() {
     const angle = Math.random() * Math.PI * 2;
     const position = near ? { x: near.x + Math.cos(angle) * 15, y: near.y + Math.sin(angle) * 12, z: near.z + (Math.random() - 0.5) * 8 } : { x: 0, y: 0, z: 0 };
     try {
+      if (noteRef.current && (saveStatus === 'dirty' || saveStatus === 'offline')) void saveDraft();
       const result = await boardApi.createNote(boardId, '새 메모', position, near?.id);
       setGraph(previous => previous ? { ...previous, nodes: [result.node, ...previous.nodes], edges: result.edge ? [...previous.edges, result.edge] : previous.edges, totalNodes: previous.totalNodes + 1 } : previous);
-      setSelectedId(result.node.id); noteRef.current = result.note; setNote(result.note); setSaveStatus('saved'); setMode('page'); setSidebarOpen(false);
+      showPanel(result.node.id);
+      setSelectedId(result.node.id); noteRef.current = result.note; setNote(result.note); setSaveStatus('saved'); setMode('neuron'); setLinking(false); setSidebarOpen(false);
       if (workerRef.current) {
         workerRef.current.onmessage = (event: MessageEvent<{ id: string; position: { x: number; y: number; z: number } }>) => {
           if (event.data.id === result.node.id) commitNode({ ...result.node, ...event.data.position });
@@ -261,7 +311,7 @@ export function App() {
       try { mergeGraph(await boardApi.graph(boardId, { focus: result.nodeId, depth: 2 })); }
       catch (cause) { setError(cause instanceof Error ? cause.message : '검색 결과를 불러오지 못했습니다.'); return; }
     }
-    if (result.nodeId) { setSelectedId(result.nodeId); setCommand({ id: Date.now(), type: 'focus', nodeId: result.nodeId }); }
+    if (result.nodeId) { showPanel(result.nodeId); setSelectedId(result.nodeId); setCommand({ id: Date.now(), type: 'focus', nodeId: result.nodeId }); }
     await loadNote(result.noteId);
     setSearch(''); setSidebarOpen(false);
   };
@@ -271,18 +321,27 @@ export function App() {
     try {
       if (saveTimer.current) clearTimeout(saveTimer.current);
       await noteApi.delete(note.id);
+      if (workerRef.current) workerRef.current.onmessage = null;
+      pendingMoves.current.delete(selectedId);
       noteRef.current = null;
       setGraph(previous => previous ? { ...previous, nodes: previous.nodes.filter(node => node.id !== selectedId), edges: previous.edges.filter(edge => edge.sourceNodeId !== selectedId && edge.targetNodeId !== selectedId), totalNodes: Math.max(0, previous.totalNodes - 1) } : previous);
-      setSelectedId(null); setNote(null); setMode('neuron'); localStorage.removeItem(`memoryplace:draft:${note.id}`);
+      setSelectedId(null); setPanel(null); setNote(null); setMode('neuron'); localStorage.removeItem(`memoryplace:draft:${note.id}`);
     } catch (cause) { setError(cause instanceof Error ? cause.message : '메모를 삭제하지 못했습니다.'); }
   };
 
-  const selectedNode = graph?.nodes.find(node => node.id === selectedId);
-  const selectedEdges = graph?.edges.filter(edge => edge.sourceNodeId === selectedId || edge.targetNodeId === selectedId) ?? [];
+  const panelNode = graph?.nodes.find(node => node.id === panel?.nodeId);
+  const panelNote = note?.id === panelNode?.noteId ? note : null;
+  const selectedEdges = graph?.edges.filter(edge => edge.sourceNodeId === panel?.nodeId || edge.targetNodeId === panel?.nodeId) ?? [];
   const updateScale = (node: GraphNode, scale: number) => {
     setGraph(previous => previous ? { ...previous, nodes: previous.nodes.map(item => item.id === node.id ? { ...item, scale } : item) } : previous);
     if (scaleTimer.current) clearTimeout(scaleTimer.current);
     scaleTimer.current = setTimeout(() => commitNode({ ...node, scale }), 260);
+  };
+  const finishDraft = () => {
+    if (!noteRef.current) return;
+    if (saveTimer.current) clearTimeout(saveTimer.current);
+    if (!noteRef.current.title.trim()) { updateDraft({ title: '제목 없음' }); return; }
+    if (saveStatus === 'dirty') void saveDraft();
   };
   const recentNodes = useMemo(() => graph?.nodes.slice(0, 26) ?? [], [graph]);
 
@@ -305,17 +364,50 @@ export function App() {
     {sidebarOpen && <button className="sidebar-backdrop" onClick={() => setSidebarOpen(false)} aria-label="메뉴 닫기" />}
 
     <main className="main-area">
-      <header className="topbar"><div className="topbar-left"><button className="icon-button menu-button" onClick={() => setSidebarOpen(true)} aria-label="메뉴 열기">☰</button><div><div className="breadcrumb">내 공간 <span>/</span> {graph?.board.title ?? '불러오는 중'}</div><h2>{mode === 'neuron' ? '생각의 우주' : note?.title ?? '페이지'}</h2></div></div><div className="topbar-actions"><div className="mode-switch" role="tablist" aria-label="보기 방식"><button role="tab" aria-label="뉴런 모드" aria-selected={mode === 'neuron'} className={mode === 'neuron' ? 'active' : ''} onClick={() => setMode('neuron')}>✧ <span>뉴런</span></button><button role="tab" aria-label="페이지 모드" aria-selected={mode === 'page'} className={mode === 'page' ? 'active' : ''} onClick={() => { if (!selectedId && graph?.nodes[0]) void selectNode(graph.nodes[0].id, true); else setMode('page'); }}>▤ <span>페이지</span></button></div><button className="top-add" onClick={() => void createNote()}><span>＋</span> 새 메모</button></div></header>
+      <header className="topbar"><div className="topbar-left"><button className="icon-button menu-button" onClick={() => setSidebarOpen(true)} aria-label="메뉴 열기">☰</button><div><div className="breadcrumb">내 공간 <span>/</span> {graph?.board.title ?? '불러오는 중'}</div><h2>{mode === 'neuron' ? '생각의 우주' : note?.title ?? '페이지'}</h2></div></div><div className="topbar-actions"><div className="mode-switch" role="tablist" aria-label="보기 방식"><button role="tab" aria-label="뉴런 모드" aria-selected={mode === 'neuron'} className={mode === 'neuron' ? 'active' : ''} onClick={() => setMode('neuron')}>✧ <span>뉴런</span></button><button role="tab" aria-label="페이지 모드" aria-selected={mode === 'page'} className={mode === 'page' ? 'active' : ''} onClick={() => { if (!selectedId && graph?.nodes[0]) void selectNode(graph.nodes[0].id, true); else { setPanel(null); setMode('page'); } }}>▤ <span>페이지</span></button></div><button className="top-add" onClick={() => void createNote()}><span>＋</span> 새 메모</button></div></header>
 
       {error && <div className="toast" role="alert">{error}<button onClick={() => setError('')} aria-label="알림 닫기">×</button></div>}
       {!graph && <div className="loading-content"><div className="loading-ring" />{loadingGraph ? '생각을 불러오고 있어요…' : '공간을 선택해 주세요.'}</div>}
-      {graph && mode === 'neuron' && <div className="graph-view">
+      {graph && mode === 'neuron' && <div className="graph-view" onPointerDownCapture={event => {
+        const target = event.target;
+        if (target instanceof Element && !panelRef.current?.contains(target) && !target.closest('.neuron-canvas')) dismissPanel();
+      }}>
         <div className="graph-glow graph-glow-a" /><div className="graph-glow graph-glow-b" />
-        <Suspense fallback={<div className="graph-loading">3D 공간을 준비하고 있어요…</div>}><NeuronCanvas graph={graph} selectedId={selectedId} linking={linking} command={command} onSelect={id => void selectNode(id)} onOpen={id => void selectNode(id, true)} onCommit={commitNode} onCamera={onCamera} onMetrics={setMetrics} /></Suspense>
+        <Suspense fallback={<div className="graph-loading">3D 공간을 준비하고 있어요…</div>}><NeuronCanvas graph={graph} selectedId={selectedId} linking={linking} command={command} onSelect={(id, anchor) => void selectNode(id, false, anchor)} onOpen={id => void selectNode(id, true)} onBackground={dismissPanel} onAnchor={updatePanelAnchor} onCommit={commitNode} onCamera={onCamera} onMetrics={setMetrics} /></Suspense>
         <div className="graph-caption"><div className="live-dot" /><span>NEURAL SPACE</span><strong>{graph.totalNodes}개의 생각 · {graph.edges.length}개의 연결</strong></div>
         <div className="graph-help">{linking ? '연결할 다른 노드를 선택하세요' : '드래그 또는 트랙패드 좌우로 360° 회전 · 세로 스크롤로 확대·축소 · 노드를 잡아 이동'}</div>
         <div className="graph-controls"><button onClick={() => setCommand({ id: Date.now(), type: 'in' })} aria-label="확대">＋</button><button onClick={() => setCommand({ id: Date.now(), type: 'out' })} aria-label="축소">−</button><span /><button onClick={() => setCommand({ id: Date.now(), type: 'fit' })} aria-label="전체 보기">◎</button></div>
-        {selectedNode && <div className="node-panel"><div className="panel-topline"><span className="panel-kind"><span className="note-dot" style={{ backgroundColor: selectedNode.color }} />선택한 생각</span><button className="panel-close" aria-label="선택 해제" onClick={() => { setSelectedId(null); setLinking(false); }}>×</button></div><h3>{note?.title ?? selectedNode.title}</h3><p>{note?.body?.trim() ? note.body.slice(0, 110) : '이 메모에 내용을 더해 보세요.'}</p><div className="size-control"><label htmlFor="node-size">노드 크기</label><input id="node-size" type="range" min="0.5" max="3" step="0.1" value={selectedNode.scale} onChange={event => updateScale(selectedNode, Number(event.target.value))} /><span>{selectedNode.scale.toFixed(1)}×</span></div>{selectedEdges.length > 0 && <div className="connections"><span>연결된 생각</span><div>{selectedEdges.slice(0, 6).map(edge => { const otherId = edge.sourceNodeId === selectedId ? edge.targetNodeId : edge.sourceNodeId; const other = graph.nodes.find(node => node.id === otherId); return <div className="connection-row" key={edge.id}><button onClick={() => void selectNode(otherId)}>{other?.title ?? '다른 생각'}</button><button aria-label={`${other?.title ?? '생각'} 연결 해제`} title="연결 해제" onClick={async () => { if (!boardId) return; try { await boardApi.unlink(boardId, edge.id); setGraph(previous => previous ? { ...previous, edges: previous.edges.filter(item => item.id !== edge.id) } : previous); } catch (cause) { setError(cause instanceof Error ? cause.message : '연결을 끊지 못했습니다.'); } }}>×</button></div>; })}</div></div>}<div className="panel-actions"><button className="primary-button" onClick={() => setMode('page')}>페이지 열기 ↗</button><button className={`secondary-button ${linking ? 'link-active' : ''}`} onClick={() => setLinking(value => !value)}>{linking ? '취소' : '⟷ 연결'}</button></div><button className="text-danger" onClick={() => void deleteSelected()}>이 메모 삭제</button></div>}
+        {panel && panelNode && <div ref={panelRef} key={`${panel.nodeId}-${panel.phase}`} className={`node-panel panel-${panel.phase}`}>
+          <div className="panel-topline">
+            <span className="panel-kind"><span className="note-dot" style={{ backgroundColor: panelNode.color }} />선택한 생각</span>
+            <button className="panel-close" aria-label="선택 해제" onClick={() => dismissPanel()}>×</button>
+          </div>
+          <input
+            className="panel-title-input"
+            aria-label="선택한 생각 제목"
+            value={panelNote?.title ?? panelNode.title}
+            disabled={!panelNote || panel.phase === 'closing'}
+            onChange={event => updateDraft({ title: event.target.value })}
+            onBlur={finishDraft}
+            maxLength={120}
+            placeholder="생각의 제목"
+          />
+          <textarea
+            className="panel-body-input"
+            aria-label="선택한 생각 내용"
+            value={panelNote?.body ?? ''}
+            disabled={!panelNote || panel.phase === 'closing'}
+            onChange={event => updateDraft({ body: event.target.value })}
+            onBlur={finishDraft}
+            maxLength={100000}
+            placeholder={panelNote ? '여기에 생각을 적어 보세요…' : '메모를 불러오는 중…'}
+          />
+          <div className={`panel-save ${saveStatus}`}>{panelNote ? statusLabel[saveStatus] : '메모를 불러오는 중…'}</div>
+          <div className="size-control"><label htmlFor="node-size">노드 크기</label><input id="node-size" type="range" min="0.5" max="3" step="0.1" value={panelNode.scale} onChange={event => updateScale(panelNode, Number(event.target.value))} /><span>{panelNode.scale.toFixed(1)}×</span></div>
+          {selectedEdges.length > 0 && <div className="connections"><span>연결된 생각</span><div>{selectedEdges.slice(0, 6).map(edge => { const otherId = edge.sourceNodeId === panel.nodeId ? edge.targetNodeId : edge.sourceNodeId; const other = graph.nodes.find(node => node.id === otherId); return <div className="connection-row" key={edge.id}><button onClick={() => void selectNode(otherId)}>{other?.title ?? '다른 생각'}</button><button disabled={edge.id.startsWith('pending:')} aria-label={`${other?.title ?? '생각'} 연결 해제`} title="연결 해제" onClick={async () => { if (!boardId) return; try { await boardApi.unlink(boardId, edge.id); setGraph(previous => previous ? { ...previous, edges: previous.edges.filter(item => item.id !== edge.id) } : previous); } catch (cause) { setError(cause instanceof Error ? cause.message : '연결을 끊지 못했습니다.'); } }}>×</button></div>; })}</div></div>}
+          <div className="panel-actions"><button className="primary-button" onClick={() => { setPanel(null); setMode('page'); }}>페이지 열기 ↗</button><button className={`secondary-button ${linking ? 'link-active' : ''}`} onClick={() => setLinking(value => !value)}>{linking ? '취소' : '⟷ 연결'}</button></div>
+          <button className="text-danger" onClick={() => void deleteSelected()}>이 메모 삭제</button>
+        </div>}
         <div className="graph-stats">{metrics.frameP95 ? `조작 프레임 p95 ${metrics.frameP95}ms · ` : ''}{metrics.visibleNodes || graph.nodes.length}개 표시 · {metrics.drawCalls || 4} draw calls</div>
       </div>}
 

@@ -1,4 +1,4 @@
-import { useEffect, useRef } from 'react';
+import { useEffect, useLayoutEffect, useRef } from 'react';
 import * as THREE from 'three';
 import type { CameraState, Graph, GraphNode, Vec3 } from '../shared/types';
 
@@ -7,8 +7,10 @@ type Props = {
   selectedId: string | null;
   linking: boolean;
   command: { id: number; type: 'fit' | 'focus' | 'in' | 'out'; nodeId?: string } | null;
-  onSelect: (nodeId: string) => void;
+  onSelect: (nodeId: string, anchor: { x: number; y: number }) => void;
   onOpen: (nodeId: string) => void;
+  onBackground: (anchor: { x: number; y: number } | null) => void;
+  onAnchor: (nodeId: string, anchor: { x: number; y: number }) => void;
   onCommit: (node: GraphNode) => void;
   onCamera: (camera: CameraState) => void;
   onMetrics: (metrics: { frameP95: number; drawCalls: number; visibleNodes: number }) => void;
@@ -95,11 +97,23 @@ class NeuronEngine {
 
   setCallbacks(callbacks: NeuronEngine['callbacks']) { this.callbacks = callbacks; }
   setLinking(linking: boolean) { this.linking = linking; }
-  setSelected(id: string | null) { this.selectedId = id; this.refreshColors(); this.invalidate(); }
+  setSelected(id: string | null) {
+    this.selectedId = id; this.refreshColors(); this.invalidate();
+    if (id) this.reportAnchor(id);
+  }
+  private reportAnchor(id: string) {
+    this.updateCamera();
+    const anchor = this.projectedNode(id);
+    if (anchor) this.callbacks.onAnchor(id, anchor);
+  }
 
   setGraph(graph: Graph) {
-    const sameTopology = this.graph.edges === graph.edges && graph.nodes.length === this.nodes.size && graph.nodes.every(node => this.nodes.has(node.id));
-    if (sameTopology && this.nodeMesh && !this.items.some(item => item.count > 1)) {
+    const sameNodes = graph.nodes.length === this.nodes.size && graph.nodes.every(node => this.nodes.has(node.id));
+    if (sameNodes && this.nodeMesh && !this.items.some(item => item.count > 1)) {
+      const linksChanged = graph.edges.length !== this.graph.edges.length || graph.edges.some((edge, index) => {
+        const previous = this.graph.edges[index];
+        return edge.sourceNodeId !== previous.sourceNodeId || edge.targetNodeId !== previous.targetNodeId;
+      });
       let recolor = false;
       for (const node of graph.nodes) {
         const previous = this.nodes.get(node.id)!;
@@ -113,6 +127,7 @@ class NeuronEngine {
         this.nodes.set(node.id, { ...node });
       }
       this.graph = graph;
+      if (linksChanged) this.buildLines();
       if (recolor) this.refreshColors();
       this.invalidate();
       return;
@@ -152,26 +167,85 @@ class NeuronEngine {
 
   private buildGeometry() {
     this.disposeGraph();
-    this.lineEndpoints.clear();
     this.items = this.makeItems();
     this.itemById = new Map(this.items.map((item, index) => [item.id, index]));
+    this.lineEndpoints.clear();
     if (!this.items.length) return;
-    const geometry = new THREE.IcosahedronGeometry(1, 1);
-    const material = new THREE.MeshBasicMaterial({ color: 0xffffff });
+    const circleVertex = `
+      varying vec2 vCircle;
+      void main() {
+        vec4 center = modelViewMatrix * instanceMatrix * vec4(0.0, 0.0, 0.0, 1.0);
+        float radius = length((instanceMatrix * vec4(1.0, 0.0, 0.0, 0.0)).xyz);
+        center.xy += position.xy * radius;
+        vCircle = position.xy;
+        gl_Position = projectionMatrix * center;
+      }
+    `;
+    const geometry = new THREE.PlaneGeometry(2, 2);
+    const material = new THREE.ShaderMaterial({
+      vertexShader: `varying vec3 vColor; ${circleVertex.replace('vCircle = position.xy;', 'vCircle = position.xy; vColor = instanceColor;')}`,
+      fragmentShader: `
+        varying vec2 vCircle;
+        varying vec3 vColor;
+        void main() {
+          float r = length(vCircle);
+          float edge = max(fwidth(r), 0.001);
+          float alpha = 1.0 - smoothstep(1.0 - edge, 1.0 + edge, r);
+          if (alpha < 0.001) discard;
+          float dome = sqrt(max(0.0, 1.0 - min(r, 1.0) * min(r, 1.0)));
+          gl_FragColor = vec4(vColor * (0.86 + 0.14 * dome), alpha);
+          #include <tonemapping_fragment>
+          #include <colorspace_fragment>
+        }
+      `,
+      transparent: true,
+      depthWrite: true,
+      side: THREE.DoubleSide,
+    });
     this.nodeMesh = new THREE.InstancedMesh(geometry, material, this.items.length);
     this.nodeMesh.instanceMatrix.setUsage(THREE.DynamicDrawUsage);
     this.nodeMesh.frustumCulled = false;
-    const haloGeometry = new THREE.SphereGeometry(1, 8, 6);
-    const haloMaterial = new THREE.MeshBasicMaterial({ color: 0x69c5c5, transparent: true, opacity: 0.065, depthWrite: false, blending: THREE.AdditiveBlending });
+    this.nodeMesh.renderOrder = 2;
+    const haloGeometry = new THREE.PlaneGeometry(2, 2);
+    const haloMaterial = new THREE.ShaderMaterial({
+      vertexShader: circleVertex,
+      fragmentShader: `
+        varying vec2 vCircle;
+        void main() {
+          float r = length(vCircle);
+          float alpha = (1.0 - smoothstep(0.0, 1.0, r)) * 0.13;
+          if (alpha < 0.001) discard;
+          gl_FragColor = vec4(0.41, 0.77, 0.77, alpha);
+          #include <tonemapping_fragment>
+          #include <colorspace_fragment>
+        }
+      `,
+      transparent: true,
+      depthWrite: false,
+      blending: THREE.AdditiveBlending,
+      side: THREE.DoubleSide,
+    });
     this.haloMesh = new THREE.InstancedMesh(haloGeometry, haloMaterial, this.items.length);
     this.haloMesh.instanceMatrix.setUsage(THREE.DynamicDrawUsage);
     this.haloMesh.frustumCulled = false;
+    this.haloMesh.renderOrder = 0;
     this.items.forEach((item, index) => this.writeMatrix(index, item));
     this.nodeMesh.instanceMatrix.needsUpdate = true;
     this.haloMesh.instanceMatrix.needsUpdate = true;
     this.refreshColors();
     this.scene.add(this.haloMesh, this.nodeMesh);
 
+    this.buildLines();
+  }
+
+  private buildLines() {
+    if (this.lineMesh) {
+      this.scene.remove(this.lineMesh);
+      this.lineMesh.geometry.dispose();
+      (this.lineMesh.material as THREE.Material).dispose();
+      this.lineMesh = null;
+    }
+    this.lineEndpoints.clear();
     const groupByNode = new Map<string, string>();
     const size = clamp(this.state.distance / 4, 18, 45);
     for (const node of this.nodes.values()) {
@@ -314,9 +388,23 @@ class NeuronEngine {
     if (!this.nodeMesh) return null;
     const rect = this.canvas.getBoundingClientRect();
     this.updateCamera();
-    this.raycaster.setFromCamera(new THREE.Vector2(((x - rect.left) / rect.width) * 2 - 1, -((y - rect.top) / rect.height) * 2 + 1), this.camera);
-    const hit = this.raycaster.intersectObject(this.nodeMesh, false)[0];
-    return hit?.instanceId === undefined ? null : this.items[hit.instanceId];
+    const focal = 1 / Math.tan(THREE.MathUtils.degToRad(this.camera.fov) / 2);
+    const center = new THREE.Vector3();
+    let nearest: Item | null = null;
+    let nearestDepth = Infinity;
+    for (const item of this.items) {
+      center.set(item.position.x, item.position.y, item.position.z).applyMatrix4(this.camera.matrixWorldInverse);
+      const depth = -center.z;
+      if (depth <= this.camera.near || depth >= this.camera.far || depth >= nearestDepth) continue;
+      const screenX = rect.left + (1 + center.x * focal / (this.camera.aspect * depth)) * rect.width / 2;
+      const screenY = rect.top + (1 - center.y * focal / depth) * rect.height / 2;
+      const radius = item.scale * 0.88 * focal * rect.height / (2 * depth);
+      if (Math.hypot(screenX - x, screenY - y) <= Math.max(radius, 8)) {
+        nearest = item;
+        nearestDepth = depth;
+      }
+    }
+    return nearest;
   }
   private pointOnPlane(x: number, y: number): THREE.Vector3 | null {
     const rect = this.canvas.getBoundingClientRect();
@@ -353,12 +441,13 @@ class NeuronEngine {
       return;
     }
     if (hit?.node) {
-      if (this.linking) { this.mode = null; this.callbacks.onSelect(hit.id); return; }
+      const anchor = this.projectedNode(hit.id) ?? { x: event.clientX, y: event.clientY };
+      if (this.linking) { this.mode = null; this.callbacks.onSelect(hit.id, anchor); return; }
       this.dragId = hit.id;
       this.mode = 'drag';
       this.selectedId = hit.id;
       this.refreshColors();
-      this.callbacks.onSelect(hit.id);
+      this.callbacks.onSelect(hit.id, anchor);
       this.dragPlane.setFromNormalAndCoplanarPoint(this.camera.getWorldDirection(new THREE.Vector3()), vector(hit.position));
       const point = this.pointOnPlane(event.clientX, event.clientY);
       this.dragOffset.copy(point ? vector(hit.position).sub(point) : new THREE.Vector3());
@@ -407,7 +496,9 @@ class NeuronEngine {
     this.state.target.z += (-right.z * dx + up.z * dy) * scale;
   }
   private onPointerUp = (event: PointerEvent) => {
-    if (!this.pointers.has(event.pointerId)) return;
+    const pointer = this.pointers.get(event.pointerId);
+    if (!pointer) return;
+    const backgroundClick = event.type === 'pointerup' && this.pointers.size === 1 && !this.moved && !pointer.hitId;
     this.pointers.delete(event.pointerId);
     if (this.mode === 'drag' && this.dragId && this.moved && !this.linking) {
       const node = this.nodes.get(this.dragId);
@@ -419,6 +510,8 @@ class NeuronEngine {
     }
     if (!this.pointers.size) {
       this.pointerActive = false;
+      if (backgroundClick) this.callbacks.onBackground(this.selectedId ? this.projectedNode(this.selectedId) : null);
+      else if (this.selectedId) this.reportAnchor(this.selectedId);
       this.callbacks.onCamera(structuredClone(this.state));
       this.mode = null; this.dragId = null; this.lastFrame = 0;
     } else {
@@ -439,6 +532,7 @@ class NeuronEngine {
     if (this.wheelCommitTimer) clearTimeout(this.wheelCommitTimer);
     this.wheelCommitTimer = setTimeout(() => {
       this.wheelCommitTimer = null;
+      if (this.selectedId) this.reportAnchor(this.selectedId);
       this.callbacks.onCamera(structuredClone(this.state));
     }, 120);
   };
@@ -466,7 +560,9 @@ class NeuronEngine {
       const radius = Math.max(18, ...all.map(node => Math.hypot(node.x - center.x, node.y - center.y, node.z - center.z)));
       this.state.target = center; this.state.distance = clamp(radius * 2.5, 35, 700);
     }
-    this.maybeRebuildClusters(); this.invalidate(); this.callbacks.onCamera(structuredClone(this.state));
+    this.maybeRebuildClusters(); this.invalidate();
+    if (this.selectedId) this.reportAnchor(this.selectedId);
+    this.callbacks.onCamera(structuredClone(this.state));
   }
 
   dispose() {
@@ -494,8 +590,8 @@ export function NeuronCanvas(props: Props) {
   const canvasRef = useRef<HTMLCanvasElement>(null);
   const labelsRef = useRef<HTMLCanvasElement>(null);
   const engineRef = useRef<NeuronEngine | null>(null);
-  const callbacksRef = useRef({ onSelect: props.onSelect, onOpen: props.onOpen, onCommit: props.onCommit, onCamera: props.onCamera, onMetrics: props.onMetrics });
-  callbacksRef.current = { onSelect: props.onSelect, onOpen: props.onOpen, onCommit: props.onCommit, onCamera: props.onCamera, onMetrics: props.onMetrics };
+  const callbacksRef = useRef({ onSelect: props.onSelect, onOpen: props.onOpen, onBackground: props.onBackground, onAnchor: props.onAnchor, onCommit: props.onCommit, onCamera: props.onCamera, onMetrics: props.onMetrics });
+  callbacksRef.current = { onSelect: props.onSelect, onOpen: props.onOpen, onBackground: props.onBackground, onAnchor: props.onAnchor, onCommit: props.onCommit, onCamera: props.onCamera, onMetrics: props.onMetrics };
 
   useEffect(() => {
     const engine = new NeuronEngine(canvasRef.current!, labelsRef.current!, props.graph, callbacksRef.current);
@@ -506,7 +602,7 @@ export function NeuronCanvas(props: Props) {
   useEffect(() => { engineRef.current?.setGraph(props.graph); }, [props.graph.nodes, props.graph.edges, props.graph.board.id]);
   useEffect(() => { engineRef.current?.setSelected(props.selectedId); }, [props.selectedId]);
   useEffect(() => { engineRef.current?.setLinking(props.linking); }, [props.linking]);
-  useEffect(() => { engineRef.current?.setCallbacks(callbacksRef.current); });
+  useLayoutEffect(() => { engineRef.current?.setCallbacks(callbacksRef.current); });
   useEffect(() => { if (props.command) engineRef.current?.run(props.command); }, [props.command]);
 
   return <div className="neuron-canvas"><canvas ref={canvasRef} aria-label="3D 뉴런 그래프" /><canvas ref={labelsRef} className="node-labels" aria-hidden="true" /></div>;
