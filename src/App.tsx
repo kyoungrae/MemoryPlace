@@ -7,7 +7,7 @@ const NeuronCanvas = lazy(() => import('./NeuronCanvas').then(module => ({ defau
 type SaveStatus = 'saved' | 'dirty' | 'saving' | 'offline' | 'conflict';
 type SearchResult = { noteId: string; nodeId?: string; title: string };
 type Anchor = { x: number; y: number };
-type PanelState = { nodeId: string; anchor: Anchor; phase: 'opening' | 'closing' };
+type PanelState = { nodeId: string; anchor: Anchor; phase: 'opening' | 'open' | 'closing' };
 
 const statusLabel: Record<SaveStatus, string> = { saved: '모든 변경사항 저장됨', dirty: '저장 대기 중', saving: '저장 중…', offline: '연결 대기 중 · 기기에 임시 보관', conflict: '다른 변경 내용과 충돌' };
 
@@ -75,7 +75,6 @@ export function App() {
   const saveTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
   const cameraTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
   const scaleTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
-  const panelTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
   const panelRef = useRef<HTMLDivElement>(null);
   const saving = useRef(false);
   const noteRequest = useRef(0);
@@ -92,12 +91,28 @@ export function App() {
     if (!parentRect) return;
     const dx = panel.anchor.x - parentRect.left - element.offsetLeft - element.offsetWidth / 2;
     const dy = panel.anchor.y - parentRect.top - element.offsetTop - element.offsetHeight / 2;
-    panelRef.current.style.setProperty('--genie-x', `${dx}px`);
-    panelRef.current.style.setProperty('--genie-y', `${dy}px`);
-    panelRef.current.style.setProperty('--genie-mid-x', `${dx * 0.36}px`);
-    panelRef.current.style.setProperty('--genie-mid-y', `${dy * 0.36}px`);
+    element.style.setProperty('--genie-x', `${dx}px`);
+    element.style.setProperty('--genie-y', `${dy}px`);
+    element.style.setProperty('--genie-mid-x', `${dx * 0.72}px`);
+    element.style.setProperty('--genie-mid-y', `${dy * 0.72}px`);
+    element.style.setProperty('--genie-mid-scale-x', `${72 / element.offsetWidth}`);
+    element.style.setProperty('--genie-mid-scale-y', `${72 / element.offsetHeight}`);
+    element.style.setProperty('--genie-scale-x', `${18 / element.offsetWidth}`);
+    element.style.setProperty('--genie-scale-y', `${18 / element.offsetHeight}`);
   }, [panel]);
-  useEffect(() => () => { if (panelTimer.current) clearTimeout(panelTimer.current); }, []);
+  useEffect(() => {
+    if (!panel || panel.phase === 'open') return;
+    const { nodeId, phase } = panel;
+    const timer = setTimeout(() => {
+      if (phase === 'opening') {
+        setPanel(current => current?.nodeId === nodeId && current.phase === 'opening' ? { ...current, phase: 'open' } : current);
+      } else {
+        setPanel(current => current?.nodeId === nodeId && current.phase === 'closing' ? null : current);
+        setSelectedId(current => current === nodeId ? null : current);
+      }
+    }, phase === 'opening' ? 500 : 460);
+    return () => clearTimeout(timer);
+  }, [panel?.nodeId, panel?.phase]);
   useEffect(() => { authApi.me().then(result => setUser(result.user)).catch(() => {}).finally(() => setBooting(false)); }, []);
   useEffect(() => {
     const worker = new Worker(new URL('./layout.worker.ts', import.meta.url), { type: 'module' });
@@ -120,7 +135,6 @@ export function App() {
       void saveDraft();
       noteRef.current = null;
     }
-    if (panelTimer.current) clearTimeout(panelTimer.current);
     setGraph(null); setSelectedId(null); setPanel(null); setNote(null); setMode('neuron'); setLoadingGraph(true);
     localStorage.setItem('memoryplace:board', boardId);
     boardApi.graph(boardId).then(result => { if (!cancelled) setGraph(result); }).catch(cause => { if (!cancelled) setError(cause instanceof Error ? cause.message : '그래프를 불러오지 못했습니다.'); }).finally(() => { if (!cancelled) setLoadingGraph(false); });
@@ -209,8 +223,7 @@ export function App() {
   });
 
   const showPanel = (nodeId: string, anchor?: Anchor) => {
-    if (panelTimer.current) clearTimeout(panelTimer.current);
-    setPanel(current => mode !== 'neuron' ? null : anchor ? { nodeId, anchor, phase: 'opening' } : current?.nodeId === nodeId ? { ...current, phase: 'opening' } : null);
+    setPanel(current => mode !== 'neuron' ? null : anchor ? { nodeId, anchor, phase: 'opening' } : current?.nodeId === nodeId ? { ...current, phase: current.phase === 'closing' ? 'opening' : current.phase } : null);
   };
   const updatePanelAnchor = (nodeId: string, anchor: Anchor) => {
     if (mode !== 'neuron' || selectedId !== nodeId) return;
@@ -218,10 +231,9 @@ export function App() {
   };
   const dismissPanel = (anchor?: Anchor | null) => {
     if (!selectedId && !panel) return;
-    setSelectedId(null); setLinking(false);
+    setLinking(false);
+    if (!panel) { setSelectedId(null); return; }
     setPanel(current => current ? { ...current, anchor: anchor ?? current.anchor, phase: 'closing' } : null);
-    if (panelTimer.current) clearTimeout(panelTimer.current);
-    panelTimer.current = setTimeout(() => setPanel(current => current?.phase === 'closing' ? null : current), 380);
   };
 
   const selectNode = async (nodeId: string, open = false, anchor?: Anchor) => {
@@ -377,7 +389,7 @@ export function App() {
         <div className="graph-caption"><div className="live-dot" /><span>NEURAL SPACE</span><strong>{graph.totalNodes}개의 생각 · {graph.edges.length}개의 연결</strong></div>
         <div className="graph-help">{linking ? '연결할 다른 노드를 선택하세요' : '드래그 또는 트랙패드 좌우로 360° 회전 · 세로 스크롤로 확대·축소 · 노드를 잡아 이동'}</div>
         <div className="graph-controls"><button onClick={() => setCommand({ id: Date.now(), type: 'in' })} aria-label="확대">＋</button><button onClick={() => setCommand({ id: Date.now(), type: 'out' })} aria-label="축소">−</button><span /><button onClick={() => setCommand({ id: Date.now(), type: 'fit' })} aria-label="전체 보기">◎</button></div>
-        {panel && panelNode && <div ref={panelRef} key={`${panel.nodeId}-${panel.phase}`} className={`node-panel panel-${panel.phase}`}>
+        {panel && panelNode && <div ref={panelRef} key={panel.nodeId} className={`node-panel panel-${panel.phase}`}>
           <div className="panel-topline">
             <span className="panel-kind"><span className="note-dot" style={{ backgroundColor: panelNode.color }} />선택한 생각</span>
             <button className="panel-close" aria-label="선택 해제" onClick={() => dismissPanel()}>×</button>
