@@ -93,12 +93,6 @@ export function App() {
     const dy = panel.anchor.y - parentRect.top - element.offsetTop - element.offsetHeight / 2;
     element.style.setProperty('--genie-x', `${dx}px`);
     element.style.setProperty('--genie-y', `${dy}px`);
-    element.style.setProperty('--genie-mid-x', `${dx * 0.72}px`);
-    element.style.setProperty('--genie-mid-y', `${dy * 0.72}px`);
-    element.style.setProperty('--genie-mid-scale-x', `${72 / element.offsetWidth}`);
-    element.style.setProperty('--genie-mid-scale-y', `${72 / element.offsetHeight}`);
-    element.style.setProperty('--genie-scale-x', `${18 / element.offsetWidth}`);
-    element.style.setProperty('--genie-scale-y', `${18 / element.offsetHeight}`);
   }, [panel]);
   useEffect(() => {
     if (!panel || panel.phase === 'open') return;
