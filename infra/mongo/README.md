@@ -19,9 +19,11 @@ docker compose -f compose.yaml up -d
 
 ```sh
 docker ps --filter name=memoryplace-mongo
-docker exec memoryplace-mongo mongosh --quiet --eval 'db.adminCommand({ ping: 1 })'
+docker exec memoryplace-mongo sh -c 'mongosh --quiet --username memoryplace_root --password "$(cat /run/secrets/mongo_root_password)" --authenticationDatabase admin --eval "db.adminCommand({ ping: 1 }).ok"'
 ```
 
 MongoDB는 서버의 `127.0.0.1:27019`에만 바인딩된다. API를 같은 Docker Compose 프로젝트에 추가하면 내부 주소 `mongo:27017`을 사용한다. 원격 관리가 필요하면 SSH 포트 포워딩을 사용한다. 비밀번호 파일은 Git에 커밋하지 않는다. 명명 볼륨 `memoryplace_mongo_data`는 컨테이너 재생성 시에도 데이터를 유지한다.
+
+Docker CLI가 `PATH`에 없는 호스트에서는 위 명령의 `docker`를 해당 호스트의 Docker 실행 파일 경로로 바꿔 실행한다.
 
 운영 단계에서 앱 전용 최소 권한 DB 사용자를 따로 만들고 관리자 계정은 초기 설정에만 사용한다. 백업 대상은 이 볼륨의 DB 내용이며, 정기 백업과 복구 시험을 구성해야 한다.
