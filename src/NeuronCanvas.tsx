@@ -39,7 +39,7 @@ class NeuronEngine {
   private graph: Graph;
   private selectedId: string | null = null;
   private pointers = new Map<number, Pointer>();
-  private mode: 'rotate' | 'pan' | 'drag' | 'pinchCamera' | 'pinchNode' | null = null;
+  private mode: 'rotate' | 'pan' | 'panXY' | 'drag' | 'pinchCamera' | 'pinchNode' | null = null;
   private dragId: string | null = null;
   private dragPlane = new THREE.Plane();
   private dragOffset = new THREE.Vector3();
@@ -51,6 +51,7 @@ class NeuronEngine {
   private lastFrame = 0;
   private qualityScale = 1;
   private pointerActive = false;
+  private controlDown = false;
   private wheelCommitTimer: ReturnType<typeof setTimeout> | null = null;
   private labelContext: CanvasRenderingContext2D;
   private callbacks: Omit<Props, 'graph' | 'selectedId' | 'linking' | 'command'>;
@@ -91,6 +92,9 @@ class NeuronEngine {
     canvas.addEventListener('wheel', this.onWheel, { passive: false });
     canvas.addEventListener('dblclick', this.onDoubleClick);
     canvas.addEventListener('contextmenu', this.preventContextMenu);
+    window.addEventListener('keydown', this.onKeyDown);
+    window.addEventListener('keyup', this.onKeyUp);
+    window.addEventListener('blur', this.onWindowBlur);
     this.setGraph(graph);
     this.resize();
   }
@@ -433,6 +437,7 @@ class NeuronEngine {
       return;
     }
     this.moved = false;
+    if (event.ctrlKey) { this.dragId = null; this.mode = 'panXY'; return; }
     if (hit?.id.startsWith('cluster:')) {
       this.mode = null;
       this.state.target = { ...hit.position };
@@ -475,6 +480,8 @@ class NeuronEngine {
       return;
     }
     if (Math.hypot(pointer.x - pointer.sx, pointer.y - pointer.sy) > 3) this.moved = true;
+    if (this.mode === 'rotate' && event.ctrlKey) this.mode = 'panXY';
+    else if (this.mode === 'panXY' && !event.ctrlKey) this.mode = 'rotate';
     if (this.mode === 'drag' && this.dragId && this.moved && !this.linking) {
       const point = this.pointOnPlane(event.clientX, event.clientY);
       if (point) this.updateNode(this.dragId, { x: point.x + this.dragOffset.x, y: point.y + this.dragOffset.y, z: point.z + this.dragOffset.z });
@@ -484,8 +491,15 @@ class NeuronEngine {
       this.invalidate();
     } else if (this.mode === 'pan') {
       this.pan(dx, dy); this.invalidate();
+    } else if (this.mode === 'panXY') {
+      this.panXY(dx, dy); this.invalidate();
     }
   };
+  private panXY(dx: number, dy: number) {
+    const scale = this.state.distance * 0.0018;
+    this.state.target.x -= dx * scale;
+    this.state.target.y += dy * scale;
+  }
   private pan(dx: number, dy: number) {
     this.updateCamera();
     const right = new THREE.Vector3().setFromMatrixColumn(this.camera.matrix, 0);
@@ -498,7 +512,7 @@ class NeuronEngine {
   private onPointerUp = (event: PointerEvent) => {
     const pointer = this.pointers.get(event.pointerId);
     if (!pointer) return;
-    const backgroundClick = event.type === 'pointerup' && this.pointers.size === 1 && !this.moved && !pointer.hitId;
+    const backgroundClick = event.type === 'pointerup' && this.pointers.size === 1 && !this.moved && !pointer.hitId && this.mode !== 'panXY';
     this.pointers.delete(event.pointerId);
     if (this.mode === 'drag' && this.dragId && this.moved && !this.linking) {
       const node = this.nodes.get(this.dragId);
@@ -522,10 +536,13 @@ class NeuronEngine {
     event.preventDefault();
     const scaleX = event.deltaMode === WheelEvent.DOM_DELTA_LINE ? 16 : event.deltaMode === WheelEvent.DOM_DELTA_PAGE ? this.canvas.clientWidth : 1;
     const scaleY = event.deltaMode === WheelEvent.DOM_DELTA_LINE ? 16 : event.deltaMode === WheelEvent.DOM_DELTA_PAGE ? this.canvas.clientHeight : 1;
-    if (event.deltaX) this.state.yaw = wrapYaw(this.state.yaw - event.deltaX * scaleX * 0.005);
-    if (event.deltaY) {
-      this.state.distance = clamp(this.state.distance * Math.exp(event.deltaY * scaleY * 0.001), 8, 700);
-      this.maybeRebuildClusters();
+    if (this.controlDown && event.ctrlKey) this.panXY(-event.deltaX * scaleX, -event.deltaY * scaleY);
+    else {
+      if (event.deltaX) this.state.yaw = wrapYaw(this.state.yaw - event.deltaX * scaleX * 0.005);
+      if (event.deltaY) {
+        this.state.distance = clamp(this.state.distance * Math.exp(event.deltaY * scaleY * 0.001), 8, 700);
+        this.maybeRebuildClusters();
+      }
     }
     if (!event.deltaX && !event.deltaY) return;
     this.invalidate();
@@ -536,6 +553,9 @@ class NeuronEngine {
       this.callbacks.onCamera(structuredClone(this.state));
     }, 120);
   };
+  private onKeyDown = (event: KeyboardEvent) => { if (event.key === 'Control' || event.ctrlKey) this.controlDown = true; };
+  private onKeyUp = (event: KeyboardEvent) => { if (event.key === 'Control' || !event.ctrlKey) this.controlDown = false; };
+  private onWindowBlur = () => { this.controlDown = false; };
   private onDoubleClick = (event: MouseEvent) => {
     const hit = this.pick(event.clientX, event.clientY);
     if (hit?.node) this.callbacks.onOpen(hit.id);
@@ -579,6 +599,9 @@ class NeuronEngine {
     this.canvas.removeEventListener('wheel', this.onWheel);
     this.canvas.removeEventListener('dblclick', this.onDoubleClick);
     this.canvas.removeEventListener('contextmenu', this.preventContextMenu);
+    window.removeEventListener('keydown', this.onKeyDown);
+    window.removeEventListener('keyup', this.onKeyUp);
+    window.removeEventListener('blur', this.onWindowBlur);
     this.disposeGraph();
     this.stars.geometry.dispose();
     (this.stars.material as THREE.Material).dispose();
