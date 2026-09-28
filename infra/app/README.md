@@ -24,7 +24,27 @@ tailscale serve --bg --https=8443 4301
 tailscale serve status
 ```
 
-접속 URL은 `https://<서버 이름>.<tailnet>.ts.net:8443/`이다. Tailscale의 `100.x.y.z` 주소는 인터넷 공개 IP가 아니며, 브라우저에서 IP를 HTTP로 여는 방식은 운영 환경의 `Secure` 로그인 쿠키와 맞지 않는다. HTTPS 이름으로 접속하면 Tailscale이 인증서를 제공한다. 서버에서 이미 사용 중인 Serve·Funnel 설정이 있다면 `tailscale serve reset`을 실행하지 않는다.
+접속 URL은 `https://<서버 이름>.<tailnet>.ts.net:8443/`이다. Tailscale의 `100.x.y.z` 주소는 인터넷 공개 IP가 아니다. 운영 앱의 `Secure` 로그인 쿠키는 아래 HTTP IP 접속에서 그대로 사용할 수 없어 전용 프록시가 이 경로의 쿠키 속성만 조정한다. HTTPS 이름으로 접속하면 Tailscale이 인증서를 제공한다. 서버에서 이미 사용 중인 Serve·Funnel 설정이 있다면 `tailscale serve reset`을 실행하지 않는다.
+
+### Tailnet IP의 4400 포트로 접속
+
+`http://100.103.129.44:4400/` 접속에는 MemoryPlace 전용 HTTP 프록시를 사용한다. Docker의 호스트 바인딩 주소를 Tailscale IP로 지정하므로 같은 tailnet에서만 접속할 수 있다. [프록시 코드](ip-http-proxy.mjs)는 기존 앱 컨테이너로 요청을 전달하고, HTTP 주소의 로그인에 필요한 `mp_session` 쿠키의 `Secure` 속성만 이 경로에서 제거한다. 기존 HTTPS 주소와 Jenkins, DB 포트는 변경하지 않는다.
+
+운영 서버에 이 저장소의 `ip-http-proxy.mjs`를 복사한 뒤 아래처럼 별도 컨테이너를 한 번 시작한다. `<프록시 파일 절대 경로>`는 서버에 복사한 파일 경로다.
+
+```sh
+docker run -d --name memoryplace-http-ip \
+  --label com.memoryplace.http-ip=true \
+  --restart unless-stopped \
+  --network memoryplace_default \
+  --publish 100.103.129.44:4400:3000 \
+  --mount type=bind,source=<프록시 파일 절대 경로>,target=/opt/memoryplace/ip-http-proxy.mjs,readonly \
+  --env EXPECTED_HOST=100.103.129.44:4400 \
+  --user node --read-only --tmpfs /tmp --security-opt no-new-privileges \
+  node:22-bookworm-slim node /opt/memoryplace/ip-http-proxy.mjs
+```
+
+배포할 때 앱 컨테이너의 Docker DNS 주소가 바뀌어도 프록시는 다시 조회한다. 상태는 `curl -fsS http://100.103.129.44:4400/api/health`로 확인한다.
 
 ## 확인
 

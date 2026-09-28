@@ -21,7 +21,7 @@ npm run dev
 ssh -N -L 127.0.0.1:27019:127.0.0.1:27019 <DB_SSH_HOST>
 ```
 
-운영 환경에서는 `npm run build && npm start`로 정적 웹 파일과 API를 같은 서버에서 제공합니다. 로그인 쿠키가 `Secure`로 설정되므로 외부 서비스 앞에는 HTTPS 역방향 프록시가 필요합니다. 호스트와 도메인 정보는 저장소에 포함하지 않습니다.
+운영 환경에서는 `npm run build && npm start`로 정적 웹 파일과 API를 같은 서버에서 제공합니다. 기본 접속은 HTTPS이며, Tailscale IP의 HTTP 포트는 MemoryPlace 전용 프록시로 제공합니다.
 
 Docker와 Jenkins를 통한 운영 배포, Tailscale 내부 HTTPS 접속 방법은 [운영 앱 안내](infra/app/README.md)에 있습니다. 저장소의 `Jenkinsfile`은 Docker 이미지 빌드, 일회용 MongoDB 통합 테스트, 배포 순서로 실행됩니다.
 
