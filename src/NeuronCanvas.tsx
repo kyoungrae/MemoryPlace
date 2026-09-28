@@ -605,8 +605,8 @@ class NeuronEngine {
   };
   private panXY(dx: number, dy: number) {
     const scale = this.state.distance * 0.0018;
-    this.state.target.x -= dx * scale;
-    this.state.target.y += dy * scale;
+    this.state.target.x += dx * scale;
+    this.state.target.y -= dy * scale;
   }
   private pan(dx: number, dy: number) {
     this.updateCamera();
