@@ -19,6 +19,7 @@ type Pointer = { x: number; y: number; sx: number; sy: number; hitId: string | n
 
 const clamp = (value: number, min: number, max: number) => Math.max(min, Math.min(max, value));
 const vector = (value: Vec3) => new THREE.Vector3(value.x, value.y, value.z);
+const wrapYaw = (yaw: number) => Math.atan2(Math.sin(yaw), Math.cos(yaw));
 
 class NeuronEngine {
   private renderer: THREE.WebGLRenderer;
@@ -48,6 +49,7 @@ class NeuronEngine {
   private lastFrame = 0;
   private qualityScale = 1;
   private pointerActive = false;
+  private wheelCommitTimer: ReturnType<typeof setTimeout> | null = null;
   private labelContext: CanvasRenderingContext2D;
   private callbacks: Omit<Props, 'graph' | 'selectedId' | 'linking' | 'command'>;
   private linking = false;
@@ -388,7 +390,7 @@ class NeuronEngine {
       const point = this.pointOnPlane(event.clientX, event.clientY);
       if (point) this.updateNode(this.dragId, { x: point.x + this.dragOffset.x, y: point.y + this.dragOffset.y, z: point.z + this.dragOffset.z });
     } else if (this.mode === 'rotate') {
-      this.state.yaw -= dx * 0.005;
+      this.state.yaw = wrapYaw(this.state.yaw - dx * 0.005);
       this.state.pitch = clamp(this.state.pitch + dy * 0.005, -1.35, 1.35);
       this.invalidate();
     } else if (this.mode === 'pan') {
@@ -425,9 +427,20 @@ class NeuronEngine {
   };
   private onWheel = (event: WheelEvent) => {
     event.preventDefault();
-    this.state.distance = clamp(this.state.distance * Math.exp(event.deltaY * 0.001), 8, 700);
-    this.maybeRebuildClusters(); this.invalidate();
-    this.callbacks.onCamera(structuredClone(this.state));
+    const scaleX = event.deltaMode === WheelEvent.DOM_DELTA_LINE ? 16 : event.deltaMode === WheelEvent.DOM_DELTA_PAGE ? this.canvas.clientWidth : 1;
+    const scaleY = event.deltaMode === WheelEvent.DOM_DELTA_LINE ? 16 : event.deltaMode === WheelEvent.DOM_DELTA_PAGE ? this.canvas.clientHeight : 1;
+    if (event.deltaX) this.state.yaw = wrapYaw(this.state.yaw - event.deltaX * scaleX * 0.005);
+    if (event.deltaY) {
+      this.state.distance = clamp(this.state.distance * Math.exp(event.deltaY * scaleY * 0.001), 8, 700);
+      this.maybeRebuildClusters();
+    }
+    if (!event.deltaX && !event.deltaY) return;
+    this.invalidate();
+    if (this.wheelCommitTimer) clearTimeout(this.wheelCommitTimer);
+    this.wheelCommitTimer = setTimeout(() => {
+      this.wheelCommitTimer = null;
+      this.callbacks.onCamera(structuredClone(this.state));
+    }, 120);
   };
   private onDoubleClick = (event: MouseEvent) => {
     const hit = this.pick(event.clientX, event.clientY);
@@ -459,6 +472,10 @@ class NeuronEngine {
   dispose() {
     this.resizeObserver.disconnect();
     cancelAnimationFrame(this.pendingFrame);
+    if (this.wheelCommitTimer) {
+      clearTimeout(this.wheelCommitTimer);
+      this.callbacks.onCamera(structuredClone(this.state));
+    }
     this.canvas.removeEventListener('pointerdown', this.onPointerDown);
     this.canvas.removeEventListener('pointermove', this.onPointerMove);
     this.canvas.removeEventListener('pointerup', this.onPointerUp);
