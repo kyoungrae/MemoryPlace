@@ -30,6 +30,7 @@ export const authApi = {
 export const boardApi = {
   list: () => api<{ boards: Board[] }>('/boards'),
   create: (title: string) => api<{ board: Board }>('/boards', { method: 'POST', body: JSON.stringify({ title }) }),
+  deleteMany: (boardIds: string[]) => api<{ ok: true; deletedBoardIds: string[] }>('/boards', { method: 'DELETE', body: JSON.stringify({ boardIds }) }),
   graph: (boardId: string, options: { offset?: number; focus?: string; depth?: number } = {}) => {
     const query = new URLSearchParams();
     if (options.offset) query.set('offset', String(options.offset));
@@ -40,6 +41,7 @@ export const boardApi = {
   camera: (boardId: string, cameraState: Board['cameraState']) => api<{ cameraState: Board['cameraState'] }>(`/boards/${boardId}/camera`, { method: 'PATCH', body: JSON.stringify(cameraState) }),
   search: (boardId: string, q: string) => api<{ results: { noteId: string; nodeId?: string; title: string }[] }>(`/boards/${boardId}/search?q=${encodeURIComponent(q)}`),
   createNote: (boardId: string, title: string, position: { x: number; y: number; z: number }, nearNodeId?: string) => api<{ note: Note; node: GraphNode; edge: GraphEdge | null }>(`/boards/${boardId}/notes`, { method: 'POST', body: JSON.stringify({ title, position, nearNodeId }) }),
+  deleteNotes: (boardId: string, noteIds: string[]) => api<{ ok: true; deletedNoteIds: string[]; deletedCount: number }>(`/boards/${boardId}/notes`, { method: 'DELETE', body: JSON.stringify({ noteIds }) }),
   moveNode: (boardId: string, node: GraphNode) => api<{ node: GraphNode }>(`/boards/${boardId}/nodes/${node.id}`, { method: 'PATCH', body: JSON.stringify({ x: node.x, y: node.y, z: node.z, scale: node.scale, revision: node.revision }) }),
   link: (boardId: string, sourceNodeId: string, targetNodeId: string) => api<{ edge: GraphEdge }>(`/boards/${boardId}/edges`, { method: 'POST', body: JSON.stringify({ sourceNodeId, targetNodeId }) }),
   unlink: (boardId: string, edgeId: string) => api<{ ok: true }>(`/boards/${boardId}/edges/${edgeId}`, { method: 'DELETE' }),

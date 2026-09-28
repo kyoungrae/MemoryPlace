@@ -47,6 +47,16 @@ function object(value: unknown): Record<string, unknown> {
 function oid(value: unknown): ObjectId | null {
   return typeof value === 'string' && ObjectId.isValid(value) ? new ObjectId(value) : null;
 }
+function objectIds(value: unknown, max = 2_000): ObjectId[] | null {
+  if (!Array.isArray(value) || value.length < 1 || value.length > max) return null;
+  const ids = new Map<string, ObjectId>();
+  for (const valueId of value) {
+    const id = oid(valueId);
+    if (!id) return null;
+    ids.set(id.toHexString(), id);
+  }
+  return [...ids.values()];
+}
 function number(value: unknown, min: number, max: number): number | null {
   return typeof value === 'number' && Number.isFinite(value) && value >= min && value <= max ? value : null;
 }
@@ -168,6 +178,21 @@ app.post('/api/boards', async (request, reply) => {
   await boards.insertOne(board);
   return reply.code(201).send({ board: serializeBoard(board) });
 });
+app.delete('/api/boards', async (request, reply) => {
+  const user = await requireUser(request, reply);
+  if (!user) return;
+  const boardIds = objectIds(object(request.body).boardIds);
+  if (!boardIds) return reply.code(400).send({ error: '삭제할 공간을 선택해 주세요.' });
+  const owned = await boards.find({ _id: { $in: boardIds }, ownerId: user._id }, { projection: { _id: 1 } }).toArray();
+  if (owned.length !== boardIds.length) return reply.code(404).send({ error: '삭제할 공간을 찾을 수 없습니다.' });
+  await Promise.all([
+    edges.deleteMany({ boardId: { $in: boardIds } }),
+    nodes.deleteMany({ boardId: { $in: boardIds } }),
+    notes.deleteMany({ boardId: { $in: boardIds } }),
+  ]);
+  await boards.deleteMany({ _id: { $in: boardIds }, ownerId: user._id });
+  return { ok: true, deletedBoardIds: owned.map(board => board._id.toHexString()) };
+});
 app.patch('/api/boards/:id/camera', async (request, reply) => {
   const user = await requireUser(request, reply);
   if (!user) return;
@@ -237,6 +262,25 @@ app.post('/api/boards/:id/notes', async (request, reply) => {
   }
   await boards.updateOne({ _id: board._id }, { $set: { updatedAt: now } });
   return reply.code(201).send({ note: serializeNote(note), node: serializeNode(node, note.title), edge: edge ? serializeEdge(edge) : null });
+});
+app.delete('/api/boards/:id/notes', async (request, reply) => {
+  const user = await requireUser(request, reply);
+  if (!user) return;
+  const board = await ownedBoard(params(request).id, user, reply);
+  if (!board) return;
+  const noteIds = objectIds(object(request.body).noteIds);
+  if (!noteIds) return reply.code(400).send({ error: '삭제할 메모를 선택해 주세요.' });
+  const foundNotes = await notes.find({ _id: { $in: noteIds }, boardId: board._id }, { projection: { _id: 1 } }).toArray();
+  if (foundNotes.length !== noteIds.length) return reply.code(404).send({ error: '삭제할 메모를 찾을 수 없습니다.' });
+  const nodeDocs = await nodes.find({ boardId: board._id, noteId: { $in: noteIds } }, { projection: { _id: 1 } }).toArray();
+  const nodeIds = nodeDocs.map(node => node._id);
+  await Promise.all([
+    nodeIds.length ? edges.deleteMany({ boardId: board._id, $or: [{ sourceNodeId: { $in: nodeIds } }, { targetNodeId: { $in: nodeIds } }] }) : Promise.resolve(),
+    nodes.deleteMany({ boardId: board._id, noteId: { $in: noteIds } }),
+    notes.deleteMany({ _id: { $in: noteIds }, boardId: board._id }),
+  ]);
+  await boards.updateOne({ _id: board._id }, { $set: { updatedAt: new Date() }, $inc: { revision: 1 } });
+  return { ok: true, deletedNoteIds: foundNotes.map(note => note._id.toHexString()), deletedCount: foundNotes.length };
 });
 app.get('/api/notes/:id', async (request, reply) => {
   const user = await requireUser(request, reply);

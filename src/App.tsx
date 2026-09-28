@@ -70,6 +70,9 @@ export function App() {
   const [error, setError] = useState('');
   const [loadingGraph, setLoadingGraph] = useState(false);
   const [loadingMore, setLoadingMore] = useState(false);
+  const [selectedBoardIds, setSelectedBoardIds] = useState<Set<string>>(() => new Set());
+  const [selectedNoteIds, setSelectedNoteIds] = useState<Set<string>>(() => new Set());
+  const [bulkDeleting, setBulkDeleting] = useState<'boards' | 'notes' | null>(null);
   const [command, setCommand] = useState<{ id: number; type: 'fit' | 'focus' | 'in' | 'out'; nodeId?: string } | null>(null);
   const [metrics, setMetrics] = useState({ frameP95: 0, drawCalls: 0, visibleNodes: 0 });
   const saveTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
@@ -129,7 +132,7 @@ export function App() {
       void saveDraft();
       noteRef.current = null;
     }
-    setGraph(null); setSelectedId(null); setPanel(null); setNote(null); setMode('neuron'); setLoadingGraph(true);
+    setGraph(null); setSelectedId(null); setPanel(null); setNote(null); setMode('neuron'); setSelectedNoteIds(new Set()); setLoadingGraph(true);
     localStorage.setItem('memoryplace:board', boardId);
     boardApi.graph(boardId).then(result => { if (!cancelled) setGraph(result); }).catch(cause => { if (!cancelled) setError(cause instanceof Error ? cause.message : '그래프를 불러오지 못했습니다.'); }).finally(() => { if (!cancelled) setLoadingGraph(false); });
     return () => { cancelled = true; };
@@ -322,6 +325,69 @@ export function App() {
     setSearch(''); setSidebarOpen(false);
   };
 
+  const toggleBoardSelection = (id: string) => setSelectedBoardIds(current => {
+    const next = new Set(current);
+    next.has(id) ? next.delete(id) : next.add(id);
+    return next;
+  });
+  const toggleNoteSelection = (id: string) => setSelectedNoteIds(current => {
+    const next = new Set(current);
+    next.has(id) ? next.delete(id) : next.add(id);
+    return next;
+  });
+  const deleteSelectedBoards = async () => {
+    const ids = [...selectedBoardIds];
+    if (!ids.length || !window.confirm(`선택한 공간 ${ids.length}개와 그 안의 모든 메모를 삭제할까요?`)) return;
+    setBulkDeleting('boards');
+    try {
+      const result = await boardApi.deleteMany(ids);
+      const deleted = new Set(result.deletedBoardIds);
+      const remaining = boards.filter(board => !deleted.has(board.id));
+      const activeBoardDeleted = Boolean(boardId && deleted.has(boardId));
+      setBoards(remaining);
+      setSelectedBoardIds(new Set());
+      if (activeBoardDeleted) {
+        if (saveTimer.current) clearTimeout(saveTimer.current);
+        noteRequest.current += 1;
+        noteRef.current = null;
+        pendingMoves.current.clear();
+        setGraph(null); setSelectedId(null); setPanel(null); setNote(null); setMode('neuron'); setLinking(false); setSearch(''); setSelectedNoteIds(new Set());
+        localStorage.removeItem('memoryplace:board');
+        setBoardId(remaining[0]?.id ?? null);
+      }
+    } catch (cause) { setError(cause instanceof Error ? cause.message : '공간을 삭제하지 못했습니다.'); }
+    finally { setBulkDeleting(null); }
+  };
+  const deleteSelectedNotes = async () => {
+    if (!boardId) return;
+    const ids = [...selectedNoteIds];
+    if (!ids.length || !window.confirm(`선택한 메모 ${ids.length}개를 삭제할까요? 연결도 함께 삭제됩니다.`)) return;
+    setBulkDeleting('notes');
+    try {
+      const result = await boardApi.deleteNotes(boardId, ids);
+      const deleted = new Set(result.deletedNoteIds);
+      const removedNodeIds = new Set((graphRef.current?.nodes ?? []).filter(node => deleted.has(node.noteId)).map(node => node.id));
+      for (const noteId of deleted) localStorage.removeItem(`memoryplace:draft:${noteId}`);
+      for (const nodeId of removedNodeIds) pendingMoves.current.delete(nodeId);
+      const activeNoteDeleted = Boolean(noteRef.current && deleted.has(noteRef.current.id));
+      const selectedNodeDeleted = Boolean(selectedId && removedNodeIds.has(selectedId));
+      setGraph(previous => previous ? {
+        ...previous,
+        nodes: previous.nodes.filter(node => !deleted.has(node.noteId)),
+        edges: previous.edges.filter(edge => !removedNodeIds.has(edge.sourceNodeId) && !removedNodeIds.has(edge.targetNodeId)),
+        totalNodes: Math.max(0, previous.totalNodes - result.deletedCount),
+      } : previous);
+      setSearchResults(current => current.filter(item => !deleted.has(item.noteId)));
+      setSelectedNoteIds(new Set());
+      if (activeNoteDeleted || selectedNodeDeleted) {
+        if (saveTimer.current) clearTimeout(saveTimer.current);
+        noteRef.current = null;
+        setSelectedId(null); setPanel(null); setNote(null); setMode('neuron'); setLinking(false);
+      }
+    } catch (cause) { setError(cause instanceof Error ? cause.message : '메모를 삭제하지 못했습니다.'); }
+    finally { setBulkDeleting(null); }
+  };
+
   const deleteSelected = async () => {
     if (!note || !selectedId || !window.confirm(`‘${note.title}’ 메모를 삭제할까요?`)) return;
     try {
@@ -331,6 +397,7 @@ export function App() {
       pendingMoves.current.delete(selectedId);
       noteRef.current = null;
       setGraph(previous => previous ? { ...previous, nodes: previous.nodes.filter(node => node.id !== selectedId), edges: previous.edges.filter(edge => edge.sourceNodeId !== selectedId && edge.targetNodeId !== selectedId), totalNodes: Math.max(0, previous.totalNodes - 1) } : previous);
+      setSelectedNoteIds(current => { const next = new Set(current); next.delete(note.id); return next; });
       setSelectedId(null); setPanel(null); setNote(null); setMode('neuron'); localStorage.removeItem(`memoryplace:draft:${note.id}`);
     } catch (cause) { setError(cause instanceof Error ? cause.message : '메모를 삭제하지 못했습니다.'); }
   };
@@ -350,6 +417,9 @@ export function App() {
     if (saveStatus === 'dirty') void saveDraft();
   };
   const recentNodes = useMemo(() => graph?.nodes.slice(0, 26) ?? [], [graph]);
+  const visibleNoteIds = useMemo(() => search.trim() ? searchResults.map(result => result.noteId) : recentNodes.map(node => node.noteId), [recentNodes, search, searchResults]);
+  const allBoardsSelected = boards.length > 0 && boards.every(board => selectedBoardIds.has(board.id));
+  const allVisibleNotesSelected = visibleNoteIds.length > 0 && visibleNoteIds.every(id => selectedNoteIds.has(id));
 
   if (booting) return <div className="loading-screen"><Logo /><div className="loading-ring" /><p>생각의 공간을 준비하고 있어요</p></div>;
   if (!user) return <AuthScreen onLogin={setUser} />;
@@ -359,11 +429,13 @@ export function App() {
     <aside className={`sidebar ${sidebarOpen ? 'sidebar-open' : ''}`}>
       <div className="sidebar-header"><Logo /><button className="icon-button mobile-close" onClick={() => setSidebarOpen(false)} aria-label="메뉴 닫기">×</button></div>
       <div className="workspace-label">내 공간 <button className="mini-add" onClick={async () => { const title = window.prompt('새 공간의 이름을 입력해 주세요.'); if (!title?.trim()) return; try { const { board } = await boardApi.create(title.trim()); setBoards(current => [board, ...current]); setBoardId(board.id); } catch (cause) { setError(cause instanceof Error ? cause.message : '공간을 만들지 못했습니다.'); } }} aria-label="새 공간 만들기">+</button></div>
-      <div className="board-list">{boards.map(board => <button key={board.id} className={`board-row ${board.id === boardId ? 'active' : ''}`} onClick={() => { setBoardId(board.id); setSidebarOpen(false); }}><span className="board-symbol">◈</span><span>{board.title}</span></button>)}</div>
+      {boards.length > 0 && <div className="bulk-toolbar"><label><input type="checkbox" checked={allBoardsSelected} onChange={() => setSelectedBoardIds(allBoardsSelected ? new Set() : new Set(boards.map(board => board.id)))} /> 전체</label><button className="bulk-delete" disabled={!selectedBoardIds.size || bulkDeleting !== null} onClick={() => void deleteSelectedBoards()}>{bulkDeleting === 'boards' ? '삭제 중…' : `선택 삭제 (${selectedBoardIds.size})`}</button></div>}
+      <div className="board-list">{boards.map(board => <div className="sidebar-select-row" key={board.id}><label className="selection-check"><input type="checkbox" checked={selectedBoardIds.has(board.id)} onChange={() => toggleBoardSelection(board.id)} aria-label={`${board.title} 선택`} /></label><button className={`board-row ${board.id === boardId ? 'active' : ''}`} onClick={() => { setBoardId(board.id); setSidebarOpen(false); }}><span className="board-symbol">◈</span><span>{board.title}</span></button></div>)}</div>
       <div className="sidebar-divider" />
       <div className="workspace-label">생각 찾아보기 <span>{graph?.totalNodes ?? 0}</span></div>
       <div className="search-box"><span>⌕</span><input value={search} onChange={event => setSearch(event.target.value)} placeholder="제목으로 검색" aria-label="메모 검색" /></div>
-      <div className="note-list">{search.trim() ? (searchResults.length ? searchResults.map(result => <button key={result.noteId} className={`note-row ${result.nodeId === selectedId ? 'active' : ''}`} onClick={() => void openSearchResult(result)}><span className="note-dot" />{result.title}</button>) : <p className="list-empty">검색 결과가 없습니다.</p>) : recentNodes.map(node => <button key={node.id} className={`note-row ${node.id === selectedId ? 'active' : ''}`} onClick={() => void selectNode(node.id)}><span className="note-dot" style={{ backgroundColor: node.color }} /><span>{node.title}</span></button>)}</div>
+      {visibleNoteIds.length > 0 && <div className="bulk-toolbar note-bulk-toolbar"><label><input type="checkbox" checked={allVisibleNotesSelected} onChange={() => setSelectedNoteIds(allVisibleNotesSelected ? new Set() : new Set(visibleNoteIds))} /> 현재 목록 전체</label><button className="bulk-delete" disabled={!selectedNoteIds.size || bulkDeleting !== null} onClick={() => void deleteSelectedNotes()}>{bulkDeleting === 'notes' ? '삭제 중…' : `선택 삭제 (${selectedNoteIds.size})`}</button></div>}
+      <div className="note-list">{search.trim() ? (searchResults.length ? searchResults.map(result => <div className="sidebar-select-row" key={result.noteId}><label className="selection-check"><input type="checkbox" checked={selectedNoteIds.has(result.noteId)} onChange={() => toggleNoteSelection(result.noteId)} aria-label={`${result.title} 선택`} /></label><button className={`note-row ${result.nodeId === selectedId ? 'active' : ''}`} onClick={() => void openSearchResult(result)}><span className="note-dot" />{result.title}</button></div>) : <p className="list-empty">검색 결과가 없습니다.</p>) : recentNodes.map(node => <div className="sidebar-select-row" key={node.id}><label className="selection-check"><input type="checkbox" checked={selectedNoteIds.has(node.noteId)} onChange={() => toggleNoteSelection(node.noteId)} aria-label={`${node.title} 선택`} /></label><button className={`note-row ${node.id === selectedId ? 'active' : ''}`} onClick={() => void selectNode(node.id)}><span className="note-dot" style={{ backgroundColor: node.color }} /><span>{node.title}</span></button></div>)}</div>
       {graph?.hasMore && !search && <button className="load-more" disabled={loadingMore} onClick={async () => { if (!boardId || loadingMore) return; setLoadingMore(true); try { mergeGraph(await boardApi.graph(boardId, { offset: graph.nodes.length })); } catch (cause) { setError(cause instanceof Error ? cause.message : '더 불러오지 못했습니다.'); } finally { setLoadingMore(false); } }}>{loadingMore ? '불러오는 중…' : '더 많은 생각 불러오기 ↓'}</button>}
       <div className="sidebar-bottom"><button className="new-note-sidebar" onClick={() => void createNote()}><span>＋</span> 새 메모 만들기</button>{boardId && <a className="export-link" href={`/api/boards/${boardId}/export`} download>↧ 현재 공간 JSON 내보내기</a>}<div className="user-row"><div className="user-avatar">A</div><div><strong>{user.username}</strong><small>나의 공간</small></div><button className="logout" title="로그아웃" onClick={async () => { await authApi.logout(); setUser(null); setGraph(null); }}>↪</button></div></div>
     </aside>

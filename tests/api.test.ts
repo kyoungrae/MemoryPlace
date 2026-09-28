@@ -91,6 +91,26 @@ test('login, password change, graph edits and optimistic conflicts', async () =>
   assert.equal(exported.data.notes.length, 5);
   const graph = await call(`/boards/${boardId}/graph`);
   assert.equal(graph.data.nodes.find((node: { id: string }) => node.id === nodeId).x, 18);
+
+  const batchFirst = await call(`/boards/${boardId}/notes`, 'POST', { title: '일괄 삭제 첫 메모', position: { x: 28, y: 9, z: 10 }, nearNodeId: initial.data.nodes[0].id });
+  const batchSecond = await call(`/boards/${boardId}/notes`, 'POST', { title: '일괄 삭제 둘째 메모', position: { x: 38, y: 9, z: 10 }, nearNodeId: initial.data.nodes[0].id });
+  const bulkNotes = await call(`/boards/${boardId}/notes`, 'DELETE', { noteIds: [batchFirst.data.note.id, batchSecond.data.note.id] });
+  assert.equal(bulkNotes.status, 200);
+  assert.equal(bulkNotes.data.deletedCount, 2);
+  const graphAfterBulkNotes = await call(`/boards/${boardId}/graph`);
+  assert.equal(graphAfterBulkNotes.data.nodes.some((node: { noteId: string }) => node.noteId === batchFirst.data.note.id), false);
+  assert.equal(graphAfterBulkNotes.data.nodes.some((node: { noteId: string }) => node.noteId === batchSecond.data.note.id), false);
+
+  const disposableBoard = await call('/boards', 'POST', { title: '일괄 삭제 테스트 공간' });
+  assert.equal(disposableBoard.status, 201);
+  const disposableBoardId = disposableBoard.data.board.id as string;
+  const disposableNote = await call(`/boards/${disposableBoardId}/notes`, 'POST', { title: '공간과 함께 삭제될 메모', position: { x: 0, y: 0, z: 0 } });
+  assert.equal(disposableNote.status, 201);
+  const bulkBoards = await call('/boards', 'DELETE', { boardIds: [disposableBoardId] });
+  assert.equal(bulkBoards.status, 200);
+  assert.deepEqual(bulkBoards.data.deletedBoardIds, [disposableBoardId]);
+  assert.equal((await call(`/boards/${disposableBoardId}/graph`)).status, 404);
+
   assert.equal((await call(`/notes/${noteId}`, 'DELETE')).status, 200);
   assert.equal((await call(`/notes/${noteId}`)).status, 404);
   assert.equal((await call('/auth/logout', 'POST')).status, 200);
