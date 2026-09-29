@@ -921,7 +921,13 @@ class NeuronEngine {
   }
   private finishLinkDrag(x: number, y: number, shouldLink: boolean) {
     const sourceId = this.linkSourceId;
-    const target = sourceId && shouldLink ? this.pickMagneticTarget(sourceId, x, y)?.item ?? this.pick(x, y) : null;
+    const directHit = sourceId && shouldLink ? this.pick(x, y) : null;
+    const target = sourceId && shouldLink
+      ? (directHit?.node && directHit.id !== sourceId ? directHit : null)
+        ?? this.pickMagneticTarget(sourceId, x, y)?.item
+        ?? this.items.find(item => item.id === this.magnetTargetId)
+        ?? null
+      : null;
     const canLink = !!sourceId && !!target?.node && target.id !== sourceId;
     this.linkAsteroidIndex = null;
     this.linkSourceId = null;
@@ -1023,7 +1029,13 @@ class NeuronEngine {
     if (!pointer) return;
     const wasLinkDrag = this.mode === 'linkDrag';
     const backgroundClick = event.type === 'pointerup' && this.pointers.size === 1 && !this.moved && !pointer.hitId && !wasLinkDrag;
-    if (wasLinkDrag) this.finishLinkDrag(event.clientX, event.clientY, event.type === 'pointerup');
+    if (wasLinkDrag) {
+      const finishX = event.type === 'pointerup' ? event.clientX : pointer.x;
+      const finishY = event.type === 'pointerup' ? event.clientY : pointer.y;
+      const interruptedHit = event.type === 'pointercancel' ? this.pick(finishX, finishY) : null;
+      const validInterruptedHit = interruptedHit?.node && interruptedHit.id !== this.linkSourceId;
+      this.finishLinkDrag(finishX, finishY, event.type === 'pointerup' || (this.moved && (this.magnetTargetId !== null || !!validInterruptedHit)));
+    }
     this.pointers.delete(event.pointerId);
     if (this.mode === 'drag' && this.dragId && this.moved && !this.linking) {
       const node = this.nodes.get(this.dragId);
