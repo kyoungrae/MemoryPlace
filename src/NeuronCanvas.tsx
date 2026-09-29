@@ -19,7 +19,7 @@ type Props = {
 
 type Item = { id: string; title: string; position: Vec3; scale: number; color: string; node?: GraphNode; count: number };
 type Pointer = { x: number; y: number; sx: number; sy: number; hitId: string | null };
-type Asteroid = { sourceId: string; angle: number; orbitFactor: number; sizeFactor: number; free: boolean; fresh: boolean; color: string };
+type Asteroid = { sourceId: string; angle: number; orbitFactor: number; sizeFactor: number; fresh: boolean; color: string };
 type AsteroidHit = { asteroid: Asteroid; index: number };
 type MagneticTarget = { item: Item; strength: number };
 
@@ -40,6 +40,7 @@ class NeuronEngine {
   private asteroidMesh: THREE.InstancedMesh | null = null;
   private asteroidMaterial: THREE.ShaderMaterial | null = null;
   private asteroidItems: Asteroid[] = [];
+  private asteroidDegrees = new Map<string, number>();
   private linkPreview: THREE.Line | null = null;
   private linkAsteroidIndex: number | null = null;
   private linkSourceId: string | null = null;
@@ -76,6 +77,8 @@ class NeuronEngine {
   private resizeObserver: ResizeObserver;
   private tempObject = new THREE.Object3D();
   private tempColor = new THREE.Color();
+  private selectedColor = new THREE.Color('#ffffff');
+  private magnetColor = new THREE.Color('#b9ffe0');
 
   constructor(private canvas: HTMLCanvasElement, private labels: HTMLCanvasElement, graph: Graph, callbacks: NeuronEngine['callbacks']) {
     this.graph = graph;
@@ -264,8 +267,8 @@ class NeuronEngine {
           core += stroke(coreDistance - 0.235, 0.014) * 0.26;
           core += exp(-dot(point - vec2(-0.04, 0.06), point - vec2(-0.04, 0.06)) * 95.0) * 0.22;
           float alpha = sphere * clamp(0.045 + light * 0.06 + rim + reflection + shellFill + shell + filaments + stars + core, 0.0, 0.92);
-          vec3 tint = mix(vec3(0.88, 0.93, 1.0), vColor, 0.18);
-          vec3 color = mix(tint, vec3(1.0), clamp(rim + filaments + stars + core, 0.0, 1.0) * 0.64);
+          vec3 tint = mix(vec3(0.83, 0.89, 0.96), vColor, 0.53);
+          vec3 color = mix(tint, vec3(1.0), clamp(rim + filaments + stars + core, 0.0, 1.0) * 0.35);
           gl_FragColor = vec4(color, alpha);
           #include <tonemapping_fragment>
           #include <colorspace_fragment>
@@ -291,7 +294,7 @@ class NeuronEngine {
           float haze = pow(max(0.0, 1.0 - r), 3.0) * 0.045;
           float alpha = atmosphere + haze;
           if (alpha < 0.001) discard;
-          gl_FragColor = vec4(mix(vec3(0.84, 0.9, 1.0), vColor, 0.18), alpha);
+          gl_FragColor = vec4(mix(vec3(0.84, 0.9, 1.0), vColor, 0.5), alpha);
           #include <tonemapping_fragment>
           #include <colorspace_fragment>
         }
@@ -448,8 +451,6 @@ class NeuronEngine {
   }
 
   private buildAsteroids() {
-    const previousCounts = new Map<string, number>();
-    for (const asteroid of this.asteroidItems) previousCounts.set(asteroid.sourceId, (previousCounts.get(asteroid.sourceId) ?? 0) + 1);
     if (this.asteroidMesh) {
       this.scene.remove(this.asteroidMesh);
       this.asteroidMesh.geometry.dispose();
@@ -463,34 +464,27 @@ class NeuronEngine {
     }
     for (const item of this.items) {
       if (!item.node) continue;
-      const markers = degree.get(item.id) ?? 0;
-      const previousCount = previousCounts.get(item.id) ?? 0;
-      const seed = hash(item.id);
-      for (let marker = 0; marker <= markers; marker++) {
-        const ring = Math.floor(marker / 8);
-        this.asteroidItems.push({
-          sourceId: item.id,
-          angle: (seed % 628) / 100 + marker * 2.399963,
-          orbitFactor: 1.65 + ring * 0.53,
-          sizeFactor: marker === markers ? 0.22 : 0.17,
-          free: marker === markers,
-          fresh: previousCount > 0 && marker >= previousCount,
-          color: item.color,
-        });
-      }
+      const links = degree.get(item.id) ?? 0;
+      const previousLinks = this.asteroidDegrees.get(item.id);
+      this.asteroidItems.push({
+        sourceId: item.id,
+        angle: (hash(item.id) % 628) / 100,
+        orbitFactor: 1.65,
+        sizeFactor: 0.22,
+        fresh: previousLinks !== undefined && links > previousLinks,
+        color: item.color,
+      });
     }
+    this.asteroidDegrees = degree;
     if (!this.asteroidItems.length) return;
     const geometry = new THREE.PlaneGeometry(2, 2);
-    geometry.setAttribute('asteroidFree', new THREE.InstancedBufferAttribute(new Float32Array(this.asteroidItems.map(item => item.free ? 1 : 0)), 1));
     geometry.setAttribute('asteroidFresh', new THREE.InstancedBufferAttribute(new Float32Array(this.asteroidItems.map(item => item.fresh ? 1 : 0)), 1));
     const material = this.asteroidMaterial ?? new THREE.ShaderMaterial({
       uniforms: { uReveal: { value: 1 } },
       vertexShader: `
-        attribute float asteroidFree;
         attribute float asteroidFresh;
         varying vec2 vCircle;
         varying vec3 vColor;
-        varying float vFree;
         varying float vFresh;
         void main() {
           vec4 center = modelViewMatrix * instanceMatrix * vec4(0.0, 0.0, 0.0, 1.0);
@@ -498,7 +492,6 @@ class NeuronEngine {
           center.xy += position.xy * radius;
           vCircle = position.xy;
           vColor = instanceColor;
-          vFree = asteroidFree;
           vFresh = asteroidFresh;
           gl_Position = projectionMatrix * center;
         }
@@ -506,7 +499,6 @@ class NeuronEngine {
       fragmentShader: `
         varying vec2 vCircle;
         varying vec3 vColor;
-        varying float vFree;
         varying float vFresh;
         uniform float uReveal;
         void main() {
@@ -515,8 +507,8 @@ class NeuronEngine {
           float alpha = 1.0 - smoothstep(1.0 - edge, 1.0 + edge, r);
           if (alpha < 0.001) discard;
           float core = exp(-r * r * 5.0);
-          vec3 color = mix(vec3(0.87, 0.93, 1.0), vColor, 0.18) * (0.78 + core * 0.25);
-          gl_FragColor = vec4(color, alpha * (0.48 + vFree * 0.20) * mix(1.0, uReveal, vFresh));
+          vec3 color = mix(vec3(0.87, 0.93, 1.0), vColor, 0.52) * (0.78 + core * 0.25);
+          gl_FragColor = vec4(color, alpha * 0.68 * mix(1.0, 0.55 + 0.45 * uReveal, vFresh));
           #include <tonemapping_fragment>
           #include <colorspace_fragment>
         }
@@ -560,8 +552,8 @@ class NeuronEngine {
   private refreshAsteroidColors() {
     if (!this.asteroidMesh) return;
     this.asteroidItems.forEach((asteroid, index) => {
-      this.tempColor.set(asteroid.sourceId === this.selectedId ? '#dffff3' : asteroid.color);
-      if (asteroid.free) this.tempColor.lerp(new THREE.Color('#96ffe3'), 0.5);
+      this.tempColor.set(asteroid.color);
+      if (asteroid.sourceId === this.selectedId) this.tempColor.lerp(this.selectedColor, 0.2);
       this.asteroidMesh!.setColorAt(index, this.tempColor);
     });
     if (this.asteroidMesh.instanceColor) this.asteroidMesh.instanceColor.needsUpdate = true;
@@ -606,7 +598,9 @@ class NeuronEngine {
   private refreshColors() {
     if (!this.nodeMesh) return;
     this.items.forEach((item, index) => {
-      this.tempColor.set(item.id === this.magnetTargetId ? '#b9ffe0' : item.id === this.selectedId ? '#e9fff7' : item.color);
+      this.tempColor.set(item.color);
+      if (item.id === this.magnetTargetId) this.tempColor.lerp(this.magnetColor, 0.65);
+      else if (item.id === this.selectedId) this.tempColor.lerp(this.selectedColor, 0.25);
       this.nodeMesh!.setColorAt(index, this.tempColor);
       this.haloMesh?.setColorAt(index, this.tempColor);
     });
