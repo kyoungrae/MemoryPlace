@@ -84,6 +84,7 @@ export function App() {
   const noteRequest = useRef(0);
   const pendingMoves = useRef(new Map<string, GraphNode>());
   const activeMoves = useRef(new Set<string>());
+  const pendingLinks = useRef(new Set<string>());
   const workerRef = useRef<Worker | null>(null);
 
   useEffect(() => { graphRef.current = graph; }, [graph]);
@@ -234,23 +235,34 @@ export function App() {
     setPanel(current => current ? { ...current, anchor: anchor ?? current.anchor, phase: 'closing' } : null);
   };
 
+  const linkNodes = async (sourceNodeId: string, targetNodeId: string) => {
+    const current = graphRef.current;
+    if (!current || !boardId) return;
+    if (sourceNodeId === targetNodeId) return;
+    const linkKey = [sourceNodeId, targetNodeId].sort().join(':');
+    const connected = current.edges.some(edge => edge.sourceNodeId === sourceNodeId && edge.targetNodeId === targetNodeId || edge.sourceNodeId === targetNodeId && edge.targetNodeId === sourceNodeId);
+    if (pendingLinks.current.has(linkKey)) return;
+    if (connected) return;
+    pendingLinks.current.add(linkKey);
+    const pending: GraphEdge = { id: `pending:${crypto.randomUUID()}`, sourceNodeId, targetNodeId, kind: 'related' };
+    setGraph(previous => previous ? { ...previous, edges: [...previous.edges, pending] } : previous);
+    try {
+      const { edge } = await boardApi.link(boardId, sourceNodeId, targetNodeId);
+      setGraph(previous => previous ? { ...previous, edges: [...previous.edges.filter(item => item.id !== pending.id && item.id !== edge.id), edge] } : previous);
+    } catch (cause) {
+      setGraph(previous => previous ? { ...previous, edges: previous.edges.filter(item => item.id !== pending.id) } : previous);
+      setError(cause instanceof Error ? cause.message : '연결을 만들지 못했습니다.');
+    } finally {
+      pendingLinks.current.delete(linkKey);
+    }
+  };
+
   const selectNode = async (nodeId: string, open = false, anchor?: Anchor) => {
     const current = graphRef.current;
     if (!current || !boardId) return;
     if (linking && selectedId && selectedId !== nodeId) {
-      const connected = current.edges.some(edge => edge.sourceNodeId === selectedId && edge.targetNodeId === nodeId || edge.sourceNodeId === nodeId && edge.targetNodeId === selectedId);
       setLinking(false);
-      if (connected) return;
-      const pending: GraphEdge = { id: `pending:${crypto.randomUUID()}`, sourceNodeId: selectedId, targetNodeId: nodeId, kind: 'related' };
-      setGraph(previous => previous ? { ...previous, edges: [...previous.edges, pending] } : previous);
-      try {
-        const { edge } = await boardApi.link(boardId, selectedId, nodeId);
-        setGraph(previous => previous ? { ...previous, edges: [...previous.edges.filter(item => item.id !== pending.id && item.id !== edge.id), edge] } : previous);
-      } catch (cause) {
-        setGraph(previous => previous ? { ...previous, edges: previous.edges.filter(item => item.id !== pending.id) } : previous);
-        setLinking(true);
-        setError(cause instanceof Error ? cause.message : '연결을 만들지 못했습니다.');
-      }
+      await linkNodes(selectedId, nodeId);
       return;
     }
     let node = current.nodes.find(item => item.id === nodeId);
@@ -454,9 +466,9 @@ export function App() {
         if (target instanceof Element && !panelRef.current?.contains(target) && !target.closest('.neuron-canvas')) dismissPanel();
       }}>
         <div className="graph-glow graph-glow-a" /><div className="graph-glow graph-glow-b" />
-        <Suspense fallback={<div className="graph-loading">3D 공간을 준비하고 있어요…</div>}><NeuronCanvas graph={graph} selectedId={selectedId} linking={linking} command={command} onSelect={(id, anchor) => void selectNode(id, false, anchor)} onOpen={id => void selectNode(id, true)} onBackground={dismissPanel} onAnchor={updatePanelAnchor} onCommit={commitNode} onCamera={onCamera} onMetrics={setMetrics} /></Suspense>
+        <Suspense fallback={<div className="graph-loading">3D 공간을 준비하고 있어요…</div>}><NeuronCanvas graph={graph} selectedId={selectedId} linking={linking} command={command} onSelect={(id, anchor) => void selectNode(id, false, anchor)} onLink={(sourceId, targetId) => void linkNodes(sourceId, targetId)} onOpen={id => void selectNode(id, true)} onBackground={dismissPanel} onAnchor={updatePanelAnchor} onCommit={commitNode} onCamera={onCamera} onMetrics={setMetrics} /></Suspense>
         <div className="graph-caption"><div className="live-dot" /><span>NEURAL SPACE</span><strong>{graph.totalNodes}개의 생각 · {graph.edges.length}개의 연결</strong></div>
-        <div className="graph-help">{linking ? '연결할 다른 노드를 선택하세요' : '드래그·트랙패드 좌우: 360° 회전 · Ctrl+드래그/스크롤: X·Y 이동 · 스크롤: 확대·축소 · 노드 이동'}</div>
+        <div className="graph-help">{linking ? '연결할 다른 노드를 선택하세요' : '트랙패드·드래그: 2D 이동 · Ctrl+드래그: 3D 시점 회전 · 떠다니는 구체를 다른 뉴런으로 드래그해 연결'}</div>
         <div className="graph-controls"><button onClick={() => setCommand({ id: Date.now(), type: 'in' })} aria-label="확대">＋</button><button onClick={() => setCommand({ id: Date.now(), type: 'out' })} aria-label="축소">−</button><span /><button onClick={() => setCommand({ id: Date.now(), type: 'fit' })} aria-label="전체 보기">◎</button></div>
         {panel && panelNode && <div ref={panelRef} key={panel.nodeId} className={`node-panel panel-${panel.phase}`}>
           <div className="panel-topline">
@@ -489,7 +501,7 @@ export function App() {
           <div className="panel-actions"><button className="primary-button" onClick={() => { setPanel(null); setMode('page'); }}>페이지 열기 ↗</button><button className={`secondary-button ${linking ? 'link-active' : ''}`} onClick={() => setLinking(value => !value)}>{linking ? '취소' : '⟷ 연결'}</button></div>
           <button className="text-danger" onClick={() => void deleteSelected()}>이 메모 삭제</button>
         </div>}
-        <div className="graph-stats">{metrics.frameP95 ? `조작 프레임 p95 ${metrics.frameP95}ms · ` : ''}{metrics.visibleNodes || graph.nodes.length}개 표시 · {metrics.drawCalls || 4} draw calls</div>
+        <div className="graph-stats">{metrics.frameP95 ? `조작 프레임 p95 ${metrics.frameP95}ms · ` : ''}{metrics.visibleNodes || graph.nodes.length}개 표시 · {metrics.drawCalls || 5} draw calls</div>
       </div>}
 
       {graph && mode === 'page' && <div className="page-view"><div className="paper-toolbar"><div><span className="paper-kicker">YOUR NOTEBOOK</span><h3>{note?.title ?? '메모를 선택해 주세요'}</h3></div><div className="paper-actions"><span className={`save-indicator ${saveStatus}`}><i />{statusLabel[saveStatus]}</span><button className="secondary-button" onClick={() => setMode('neuron')}>✧ 그래프로 보기</button></div></div>{note ? <div className="paper-shell"><div className="paper"><div className="paper-margin" /><div className="paper-content"><input className="paper-title" value={note.title} onChange={event => updateDraft({ title: event.target.value })} placeholder="제목을 입력하세요" maxLength={120} aria-label="메모 제목" /><div className="paper-date">{new Date(note.updatedAt).toLocaleDateString('ko-KR', { year: 'numeric', month: 'long', day: 'numeric' })}</div><textarea className="paper-body" value={note.body} onChange={event => updateDraft({ body: event.target.value })} placeholder="여기에 생각을 자유롭게 적어 보세요..." maxLength={100000} aria-label="메모 내용" /></div></div><div className="paper-footer"><span>{note.body.length.toLocaleString()}자</span><div>{saveStatus === 'conflict' && <><button onClick={async () => { const result = await noteApi.get(note.id); localStorage.removeItem(`memoryplace:draft:${note.id}`); noteRef.current = result.note; setNote(result.note); setSaveStatus('saved'); }}>서버 내용 불러오기</button><button onClick={async () => { const result = await noteApi.get(note.id); noteRef.current = { ...noteRef.current!, revision: result.note.revision }; setNote(noteRef.current); setSaveStatus('dirty'); void saveDraft(); }}>내 내용으로 저장</button></>}{saveStatus === 'offline' && <button onClick={() => void saveDraft()}>다시 저장</button>}<button className="text-danger" onClick={() => void deleteSelected()}>삭제</button></div></div></div> : <div className="page-empty"><div>▤</div><h3>아직 열린 메모가 없어요</h3><p>왼쪽 목록에서 메모를 고르거나 새로 만들어 보세요.</p><button className="primary-button" onClick={() => void createNote()}>새 메모 만들기</button></div>}</div>}

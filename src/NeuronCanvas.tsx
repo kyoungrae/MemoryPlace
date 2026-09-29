@@ -8,6 +8,7 @@ type Props = {
   linking: boolean;
   command: { id: number; type: 'fit' | 'focus' | 'in' | 'out'; nodeId?: string } | null;
   onSelect: (nodeId: string, anchor: { x: number; y: number }) => void;
+  onLink: (sourceNodeId: string, targetNodeId: string) => void;
   onOpen: (nodeId: string) => void;
   onBackground: (anchor: { x: number; y: number } | null) => void;
   onAnchor: (nodeId: string, anchor: { x: number; y: number }) => void;
@@ -18,10 +19,13 @@ type Props = {
 
 type Item = { id: string; title: string; position: Vec3; scale: number; color: string; node?: GraphNode; count: number };
 type Pointer = { x: number; y: number; sx: number; sy: number; hitId: string | null };
+type Asteroid = { sourceId: string; phase: number; orbit: number; size: number; free: boolean; color: string };
+type AsteroidHit = { asteroid: Asteroid; index: number; position: THREE.Vector3 };
 
 const clamp = (value: number, min: number, max: number) => Math.max(min, Math.min(max, value));
 const vector = (value: Vec3) => new THREE.Vector3(value.x, value.y, value.z);
 const wrapYaw = (yaw: number) => Math.atan2(Math.sin(yaw), Math.cos(yaw));
+const hash = (value: string) => [...value].reduce((result, character) => (result * 31 + character.charCodeAt(0)) >>> 0, 17);
 
 class NeuronEngine {
   private renderer: THREE.WebGLRenderer;
@@ -32,6 +36,12 @@ class NeuronEngine {
   private haloMesh: THREE.InstancedMesh | null = null;
   private lineMesh: THREE.Mesh<THREE.InstancedBufferGeometry, THREE.ShaderMaterial> | null = null;
   private lineMaterial: THREE.ShaderMaterial | null = null;
+  private asteroidMesh: THREE.InstancedMesh | null = null;
+  private asteroidMaterial: THREE.ShaderMaterial | null = null;
+  private asteroidItems: Asteroid[] = [];
+  private linkPreview: THREE.Line | null = null;
+  private linkAsteroidIndex: number | null = null;
+  private linkSourceId: string | null = null;
   private stars: THREE.Points;
   private items: Item[] = [];
   private itemById = new Map<string, number>();
@@ -41,7 +51,7 @@ class NeuronEngine {
   private graph: Graph;
   private selectedId: string | null = null;
   private pointers = new Map<number, Pointer>();
-  private mode: 'rotate' | 'pan' | 'panXY' | 'drag' | 'pinchCamera' | 'pinchNode' | null = null;
+  private mode: 'rotate' | 'pan' | 'panXY' | 'drag' | 'linkDrag' | 'pinchCamera' | 'pinchNode' | null = null;
   private dragId: string | null = null;
   private dragPlane = new THREE.Plane();
   private dragOffset = new THREE.Vector3();
@@ -49,6 +59,7 @@ class NeuronEngine {
   private pinchStart = { distance: 1, cameraDistance: 1, nodeScale: 1, midpointX: 0, midpointY: 0 };
   private state: CameraState;
   private pendingFrame = 0;
+  private animationTimer: number | null = null;
   private frameTimes: number[] = [];
   private lastFrame = 0;
   private qualityScale = 1;
@@ -104,7 +115,7 @@ class NeuronEngine {
   setCallbacks(callbacks: NeuronEngine['callbacks']) { this.callbacks = callbacks; }
   setLinking(linking: boolean) { this.linking = linking; }
   setSelected(id: string | null) {
-    this.selectedId = id; this.refreshColors(); this.refreshLineColors(); this.invalidate();
+    this.selectedId = id; this.refreshColors(); this.refreshLineColors(); this.refreshAsteroidColors(); this.invalidate();
     if (id) this.reportAnchor(id);
   }
   private reportAnchor(id: string) {
@@ -133,7 +144,7 @@ class NeuronEngine {
         this.nodes.set(node.id, { ...node });
       }
       this.graph = graph;
-      if (linksChanged) this.buildLines();
+      if (linksChanged) { this.buildLines(); this.buildAsteroids(); }
       if (recolor) this.refreshColors();
       this.invalidate();
       return;
@@ -169,7 +180,10 @@ class NeuronEngine {
       if (mesh) { this.scene.remove(mesh); mesh.geometry.dispose(); (mesh.material as THREE.Material).dispose(); }
     }
     if (this.lineMesh) { this.scene.remove(this.lineMesh); this.lineMesh.geometry.dispose(); }
-    this.nodeMesh = null; this.haloMesh = null; this.lineMesh = null;
+    if (this.asteroidMesh) { this.scene.remove(this.asteroidMesh); this.asteroidMesh.geometry.dispose(); }
+    this.nodeMesh = null; this.haloMesh = null; this.lineMesh = null; this.asteroidMesh = null;
+    this.asteroidItems = []; this.linkAsteroidIndex = null; this.linkSourceId = null;
+    this.clearLinkPreview();
     this.lineEndpoints.clear(); this.linePairs = [];
   }
 
@@ -201,7 +215,13 @@ class NeuronEngine {
           float alpha = 1.0 - smoothstep(1.0 - edge, 1.0 + edge, r);
           if (alpha < 0.001) discard;
           float dome = sqrt(max(0.0, 1.0 - min(r, 1.0) * min(r, 1.0)));
-          gl_FragColor = vec4(vColor * (0.86 + 0.14 * dome), alpha);
+          float angle = atan(vCircle.y, vCircle.x);
+          float currents = 0.5 + 0.5 * sin(angle * 5.0 + r * 15.0);
+          float core = exp(-r * r * 7.0);
+          vec3 deep = mix(vColor * 0.18, vec3(0.07, 0.15, 0.25), 0.42);
+          vec3 plasma = mix(vColor, vec3(0.45, 0.78, 1.0), 0.18 + currents * 0.16);
+          vec3 color = mix(deep, plasma, 0.42 + dome * 0.36 + core * 0.22);
+          gl_FragColor = vec4(color, alpha * (0.58 + dome * 0.3));
           #include <tonemapping_fragment>
           #include <colorspace_fragment>
         }
@@ -216,14 +236,15 @@ class NeuronEngine {
     this.nodeMesh.renderOrder = 2;
     const haloGeometry = new THREE.PlaneGeometry(2, 2);
     const haloMaterial = new THREE.ShaderMaterial({
-      vertexShader: circleVertex,
+      vertexShader: `varying vec3 vColor; ${circleVertex.replace('vCircle = position.xy;', 'vCircle = position.xy; vColor = instanceColor;')}`,
       fragmentShader: `
         varying vec2 vCircle;
+        varying vec3 vColor;
         void main() {
           float r = length(vCircle);
-          float alpha = (1.0 - smoothstep(0.0, 1.0, r)) * 0.13;
+          float alpha = (1.0 - smoothstep(0.0, 1.0, r)) * 0.16;
           if (alpha < 0.001) discard;
-          gl_FragColor = vec4(0.41, 0.77, 0.77, alpha);
+          gl_FragColor = vec4(mix(vColor, vec3(0.35, 0.84, 0.96), 0.28), alpha);
           #include <tonemapping_fragment>
           #include <colorspace_fragment>
         }
@@ -244,6 +265,7 @@ class NeuronEngine {
     this.scene.add(this.haloMesh, this.nodeMesh);
 
     this.buildLines();
+    this.buildAsteroids();
   }
 
   private buildLines() {
@@ -378,6 +400,143 @@ class NeuronEngine {
     colors.needsUpdate = true;
   }
 
+  private buildAsteroids() {
+    if (this.asteroidMesh) {
+      this.scene.remove(this.asteroidMesh);
+      this.asteroidMesh.geometry.dispose();
+      this.asteroidMesh = null;
+    }
+    this.asteroidItems = [];
+    const degree = new Map<string, number>();
+    for (const edge of this.graph.edges) {
+      degree.set(edge.sourceNodeId, (degree.get(edge.sourceNodeId) ?? 0) + 1);
+      degree.set(edge.targetNodeId, (degree.get(edge.targetNodeId) ?? 0) + 1);
+    }
+    for (const item of this.items) {
+      if (!item.node) continue;
+      const markers = degree.get(item.id) ?? 0;
+      const seed = hash(item.id);
+      for (let marker = 0; marker <= markers; marker++) {
+        this.asteroidItems.push({
+          sourceId: item.id,
+          phase: ((seed + marker * 137) % 628) / 100,
+          orbit: item.scale * (1.62 + marker * 0.46),
+          size: item.scale * (marker === markers ? 0.22 : 0.17),
+          free: marker === markers,
+          color: item.color,
+        });
+      }
+    }
+    if (!this.asteroidItems.length) return;
+    const geometry = new THREE.PlaneGeometry(2, 2);
+    geometry.setAttribute('asteroidOrbit', new THREE.InstancedBufferAttribute(new Float32Array(this.asteroidItems.map(item => item.orbit)), 1).setUsage(THREE.DynamicDrawUsage));
+    geometry.setAttribute('asteroidPhase', new THREE.InstancedBufferAttribute(new Float32Array(this.asteroidItems.map(item => item.phase)), 1));
+    geometry.setAttribute('asteroidFree', new THREE.InstancedBufferAttribute(new Float32Array(this.asteroidItems.map(item => item.free ? 1 : 0)), 1));
+    const material = this.asteroidMaterial ?? new THREE.ShaderMaterial({
+      uniforms: {
+        uTime: { value: 0 },
+        uBirth: { value: 0 },
+      },
+      vertexShader: `
+        attribute float asteroidOrbit;
+        attribute float asteroidPhase;
+        attribute float asteroidFree;
+        uniform float uTime;
+        uniform float uBirth;
+        varying vec2 vCircle;
+        varying vec3 vColor;
+        varying float vFree;
+        varying float vReveal;
+        void main() {
+          vec4 center = modelViewMatrix * instanceMatrix * vec4(0.0, 0.0, 0.0, 1.0);
+          float angle = uTime * (0.9 + asteroidFree * 0.35) + asteroidPhase;
+          center.xy += vec2(cos(angle), sin(angle * 1.17)) * asteroidOrbit;
+          center.z += sin(angle * 1.9 + asteroidPhase) * asteroidOrbit * 0.16;
+          float radius = length((instanceMatrix * vec4(1.0, 0.0, 0.0, 0.0)).xyz);
+          center.xy += position.xy * radius;
+          vCircle = position.xy;
+          vColor = instanceColor;
+          vFree = asteroidFree;
+          vReveal = smoothstep(0.0, 0.42, uTime - uBirth - fract(asteroidPhase) * 0.14);
+          gl_Position = projectionMatrix * center;
+        }
+      `,
+      fragmentShader: `
+        varying vec2 vCircle;
+        varying vec3 vColor;
+        varying float vFree;
+        varying float vReveal;
+        void main() {
+          float r = length(vCircle);
+          float edge = max(fwidth(r), 0.001);
+          float alpha = 1.0 - smoothstep(1.0 - edge, 1.0 + edge, r);
+          if (alpha < 0.001) discard;
+          float core = exp(-r * r * 5.0);
+          vec3 color = mix(vColor * 0.48, vec3(0.72, 1.0, 0.92), vFree * (0.48 + core * 0.32));
+          gl_FragColor = vec4(color * (0.7 + core * 0.48), alpha * vReveal * (0.55 + vFree * 0.34));
+          #include <tonemapping_fragment>
+          #include <colorspace_fragment>
+        }
+      `,
+      transparent: true,
+      depthWrite: false,
+      blending: THREE.AdditiveBlending,
+      side: THREE.DoubleSide,
+    });
+    this.asteroidMaterial = material;
+    material.uniforms.uBirth.value = performance.now() * 0.001;
+    const mesh = new THREE.InstancedMesh(geometry, material, this.asteroidItems.length);
+    mesh.instanceMatrix.setUsage(THREE.DynamicDrawUsage);
+    mesh.frustumCulled = false;
+    mesh.renderOrder = 3;
+    this.asteroidMesh = mesh;
+    this.asteroidItems.forEach((asteroid, index) => this.writeAsteroidMatrix(index, asteroid));
+    mesh.instanceMatrix.needsUpdate = true;
+    this.refreshAsteroidColors();
+    this.scene.add(mesh);
+  }
+
+  private writeAsteroidMatrix(index: number, asteroid: Asteroid, position?: THREE.Vector3) {
+    const source = position ?? (this.nodes.has(asteroid.sourceId) ? vector(this.nodes.get(asteroid.sourceId)!) : new THREE.Vector3());
+    this.tempObject.position.copy(source);
+    this.tempObject.scale.setScalar(asteroid.size);
+    this.tempObject.updateMatrix();
+    this.asteroidMesh?.setMatrixAt(index, this.tempObject.matrix);
+  }
+
+  private refreshAsteroidColors() {
+    if (!this.asteroidMesh) return;
+    this.asteroidItems.forEach((asteroid, index) => {
+      this.tempColor.set(asteroid.sourceId === this.selectedId ? '#dffff3' : asteroid.color);
+      if (asteroid.free) this.tempColor.lerp(new THREE.Color('#96ffe3'), 0.5);
+      this.asteroidMesh!.setColorAt(index, this.tempColor);
+    });
+    if (this.asteroidMesh.instanceColor) this.asteroidMesh.instanceColor.needsUpdate = true;
+  }
+
+  private clearLinkPreview() {
+    if (!this.linkPreview) return;
+    this.scene.remove(this.linkPreview);
+    this.linkPreview.geometry.dispose();
+    (this.linkPreview.material as THREE.Material).dispose();
+    this.linkPreview = null;
+  }
+
+  private updateLinkPreview(source: Vec3, target: THREE.Vector3) {
+    if (!this.linkPreview) {
+      const geometry = new THREE.BufferGeometry();
+      geometry.setAttribute('position', new THREE.Float32BufferAttribute([source.x, source.y, source.z, target.x, target.y, target.z], 3));
+      this.linkPreview = new THREE.Line(geometry, new THREE.LineBasicMaterial({ color: 0x8cffe0, transparent: true, opacity: 0.8, depthWrite: false }));
+      this.linkPreview.renderOrder = 4;
+      this.scene.add(this.linkPreview);
+      return;
+    }
+    const positions = this.linkPreview.geometry.getAttribute('position') as THREE.BufferAttribute;
+    positions.setXYZ(0, source.x, source.y, source.z);
+    positions.setXYZ(1, target.x, target.y, target.z);
+    positions.needsUpdate = true;
+  }
+
   private writeMatrix(index: number, item: Item) {
     this.tempObject.position.copy(vector(item.position));
     this.tempObject.scale.setScalar(item.scale * 0.88);
@@ -393,8 +552,10 @@ class NeuronEngine {
     this.items.forEach((item, index) => {
       this.tempColor.set(item.id === this.selectedId ? '#e9fff7' : item.color);
       this.nodeMesh!.setColorAt(index, this.tempColor);
+      this.haloMesh?.setColorAt(index, this.tempColor);
     });
     if (this.nodeMesh.instanceColor) this.nodeMesh.instanceColor.needsUpdate = true;
+    if (this.haloMesh?.instanceColor) this.haloMesh.instanceColor.needsUpdate = true;
   }
 
   private updateNode(id: string, patch: Partial<GraphNode>) {
@@ -408,6 +569,12 @@ class NeuronEngine {
       this.writeMatrix(index, item);
       if (this.nodeMesh) this.nodeMesh.instanceMatrix.needsUpdate = true;
       if (this.haloMesh) this.haloMesh.instanceMatrix.needsUpdate = true;
+    }
+    if (this.asteroidMesh) {
+      this.asteroidItems.forEach((asteroid, asteroidIndex) => {
+        if (asteroid.sourceId === id && asteroidIndex !== this.linkAsteroidIndex) this.writeAsteroidMatrix(asteroidIndex, asteroid);
+      });
+      this.asteroidMesh.instanceMatrix.needsUpdate = true;
     }
     if (this.lineMesh && this.lineEndpoints.has(id)) {
       const starts = this.lineMesh.geometry.getAttribute('edgeStart') as THREE.InstancedBufferAttribute;
@@ -478,6 +645,7 @@ class NeuronEngine {
   private render = (time: number) => {
     this.pendingFrame = 0;
     this.updateCamera();
+    if (this.asteroidMaterial) this.asteroidMaterial.uniforms.uTime.value = time * 0.001;
     this.renderer.render(this.scene, this.camera);
     this.drawLabels();
     if (this.pointerActive && this.lastFrame) {
@@ -492,6 +660,12 @@ class NeuronEngine {
     }
     this.lastFrame = time;
     if (this.pointerActive) this.invalidate();
+    else if (this.asteroidMesh && document.visibilityState === 'visible' && !this.animationTimer) {
+      this.animationTimer = window.setTimeout(() => {
+        this.animationTimer = null;
+        this.invalidate();
+      }, 32);
+    }
   };
   private invalidate() { if (!this.pendingFrame) this.pendingFrame = requestAnimationFrame(this.render); }
 
@@ -517,6 +691,43 @@ class NeuronEngine {
     }
     return nearest;
   }
+  private asteroidWorldPosition(asteroid: Asteroid, time: number, right: THREE.Vector3, up: THREE.Vector3, forward: THREE.Vector3, result: THREE.Vector3) {
+    const source = this.nodes.get(asteroid.sourceId);
+    if (!source) return result.set(0, 0, 0);
+    const angle = time * (0.9 + (asteroid.free ? 0.35 : 0)) + asteroid.phase;
+    return result.set(source.x, source.y, source.z)
+      .addScaledVector(right, Math.cos(angle) * asteroid.orbit)
+      .addScaledVector(up, Math.sin(angle * 1.17) * asteroid.orbit)
+      .addScaledVector(forward, -Math.sin(angle * 1.9 + asteroid.phase) * asteroid.orbit * 0.16);
+  }
+  private pickAsteroid(x: number, y: number): AsteroidHit | null {
+    if (!this.asteroidMesh) return null;
+    const rect = this.canvas.getBoundingClientRect();
+    this.updateCamera();
+    const focal = 1 / Math.tan(THREE.MathUtils.degToRad(this.camera.fov) / 2);
+    const right = new THREE.Vector3().setFromMatrixColumn(this.camera.matrix, 0);
+    const up = new THREE.Vector3().setFromMatrixColumn(this.camera.matrix, 1);
+    const forward = this.camera.getWorldDirection(new THREE.Vector3());
+    const world = new THREE.Vector3();
+    const view = new THREE.Vector3();
+    let result: AsteroidHit | null = null;
+    let nearestDepth = Infinity;
+    const time = performance.now() * 0.001;
+    this.asteroidItems.forEach((asteroid, index) => {
+      this.asteroidWorldPosition(asteroid, time, right, up, forward, world);
+      view.copy(world).applyMatrix4(this.camera.matrixWorldInverse);
+      const depth = -view.z;
+      if (depth <= this.camera.near || depth >= this.camera.far || depth >= nearestDepth) return;
+      const screenX = rect.left + (1 + view.x * focal / (this.camera.aspect * depth)) * rect.width / 2;
+      const screenY = rect.top + (1 - view.y * focal / depth) * rect.height / 2;
+      const radius = Math.max(10, asteroid.size * focal * rect.height * 1.25 / depth);
+      if (Math.hypot(screenX - x, screenY - y) <= radius) {
+        result = { asteroid, index, position: world.clone() };
+        nearestDepth = depth;
+      }
+    });
+    return result;
+  }
   private pointOnPlane(x: number, y: number): THREE.Vector3 | null {
     const rect = this.canvas.getBoundingClientRect();
     this.raycaster.setFromCamera(new THREE.Vector2(((x - rect.left) / rect.width) * 2 - 1, -((y - rect.top) / rect.height) * 2 + 1), this.camera);
@@ -530,12 +741,56 @@ class NeuronEngine {
     return { x: rect.left + (p.x + 1) * rect.width / 2, y: rect.top + (-p.y + 1) * rect.height / 2 };
   }
 
+  private startLinkDrag(hit: AsteroidHit, event: PointerEvent) {
+    const source = this.nodes.get(hit.asteroid.sourceId);
+    if (!source) return;
+    this.mode = 'linkDrag';
+    this.dragId = null;
+    this.linkAsteroidIndex = hit.index;
+    this.linkSourceId = hit.asteroid.sourceId;
+    this.selectedId = hit.asteroid.sourceId;
+    this.refreshColors();
+    this.refreshLineColors();
+    this.refreshAsteroidColors();
+    this.dragPlane.setFromNormalAndCoplanarPoint(this.camera.getWorldDirection(new THREE.Vector3()), vector(source));
+    const orbit = this.asteroidMesh?.geometry.getAttribute('asteroidOrbit') as THREE.InstancedBufferAttribute | undefined;
+    if (orbit) {
+      orbit.setX(hit.index, 0);
+      orbit.addUpdateRange(hit.index, 1);
+      orbit.needsUpdate = true;
+    }
+    this.moveLinkDrag(event.clientX, event.clientY);
+  }
+  private moveLinkDrag(x: number, y: number) {
+    if (this.linkAsteroidIndex === null || !this.linkSourceId) return;
+    const source = this.nodes.get(this.linkSourceId);
+    const asteroid = this.asteroidItems[this.linkAsteroidIndex];
+    const point = this.pointOnPlane(x, y);
+    if (!source || !asteroid || !point) return;
+    this.writeAsteroidMatrix(this.linkAsteroidIndex, asteroid, point);
+    if (this.asteroidMesh) this.asteroidMesh.instanceMatrix.needsUpdate = true;
+    this.updateLinkPreview(source, point);
+    this.invalidate();
+  }
+  private finishLinkDrag(x: number, y: number, shouldLink: boolean) {
+    const sourceId = this.linkSourceId;
+    const target = shouldLink ? this.pick(x, y) : null;
+    this.linkAsteroidIndex = null;
+    this.linkSourceId = null;
+    this.clearLinkPreview();
+    this.buildAsteroids();
+    if (sourceId && target?.node && target.id !== sourceId) this.callbacks.onLink(sourceId, target.id);
+    this.invalidate();
+  }
+
   private onPointerDown = (event: PointerEvent) => {
     this.canvas.setPointerCapture(event.pointerId);
     const hit = this.pick(event.clientX, event.clientY);
-    this.pointers.set(event.pointerId, { x: event.clientX, y: event.clientY, sx: event.clientX, sy: event.clientY, hitId: hit?.id ?? null });
+    const asteroidHit = event.ctrlKey ? null : this.pickAsteroid(event.clientX, event.clientY);
+    this.pointers.set(event.pointerId, { x: event.clientX, y: event.clientY, sx: event.clientX, sy: event.clientY, hitId: asteroidHit?.asteroid.sourceId ?? hit?.id ?? null });
     this.pointerActive = true;
     if (this.pointers.size === 2) {
+      if (this.mode === 'linkDrag') this.finishLinkDrag(event.clientX, event.clientY, false);
       const [a, b] = [...this.pointers.values()];
       const midpointX = (a.x + b.x) / 2, midpointY = (a.y + b.y) / 2;
       const selectedPoint = this.selectedId ? this.projectedNode(this.selectedId) : null;
@@ -544,7 +799,8 @@ class NeuronEngine {
       return;
     }
     this.moved = false;
-    if (event.ctrlKey) { this.dragId = null; this.mode = 'panXY'; return; }
+    if (event.ctrlKey) { this.dragId = null; this.mode = 'rotate'; return; }
+    if (asteroidHit) { this.startLinkDrag(asteroidHit, event); return; }
     if (hit?.id.startsWith('cluster:')) {
       this.mode = null;
       this.state.target = { ...hit.position };
@@ -565,7 +821,7 @@ class NeuronEngine {
       const point = this.pointOnPlane(event.clientX, event.clientY);
       this.dragOffset.copy(point ? vector(hit.position).sub(point) : new THREE.Vector3());
       this.invalidate();
-    } else { this.dragId = null; this.mode = event.button === 2 || event.shiftKey ? 'pan' : 'rotate'; }
+    } else { this.dragId = null; this.mode = 'panXY'; }
   };
   private onPointerMove = (event: PointerEvent) => {
     const pointer = this.pointers.get(event.pointerId);
@@ -588,8 +844,9 @@ class NeuronEngine {
       return;
     }
     if (Math.hypot(pointer.x - pointer.sx, pointer.y - pointer.sy) > 3) this.moved = true;
-    if (this.mode === 'rotate' && event.ctrlKey) this.mode = 'panXY';
-    else if (this.mode === 'panXY' && !event.ctrlKey) this.mode = 'rotate';
+    if (this.mode === 'linkDrag') { this.moveLinkDrag(event.clientX, event.clientY); return; }
+    if (this.mode === 'rotate' && !event.ctrlKey) this.mode = 'panXY';
+    else if (this.mode === 'panXY' && event.ctrlKey) this.mode = 'rotate';
     if (this.mode === 'drag' && this.dragId && this.moved && !this.linking) {
       const point = this.pointOnPlane(event.clientX, event.clientY);
       if (point) this.updateNode(this.dragId, { x: point.x + this.dragOffset.x, y: point.y + this.dragOffset.y, z: point.z + this.dragOffset.z });
@@ -620,7 +877,9 @@ class NeuronEngine {
   private onPointerUp = (event: PointerEvent) => {
     const pointer = this.pointers.get(event.pointerId);
     if (!pointer) return;
-    const backgroundClick = event.type === 'pointerup' && this.pointers.size === 1 && !this.moved && !pointer.hitId && this.mode !== 'panXY';
+    const wasLinkDrag = this.mode === 'linkDrag';
+    const backgroundClick = event.type === 'pointerup' && this.pointers.size === 1 && !this.moved && !pointer.hitId && !wasLinkDrag;
+    if (wasLinkDrag) this.finishLinkDrag(event.clientX, event.clientY, event.type === 'pointerup');
     this.pointers.delete(event.pointerId);
     if (this.mode === 'drag' && this.dragId && this.moved && !this.linking) {
       const node = this.nodes.get(this.dragId);
@@ -644,13 +903,13 @@ class NeuronEngine {
     event.preventDefault();
     const scaleX = event.deltaMode === WheelEvent.DOM_DELTA_LINE ? 16 : event.deltaMode === WheelEvent.DOM_DELTA_PAGE ? this.canvas.clientWidth : 1;
     const scaleY = event.deltaMode === WheelEvent.DOM_DELTA_LINE ? 16 : event.deltaMode === WheelEvent.DOM_DELTA_PAGE ? this.canvas.clientHeight : 1;
-    if (this.controlDown && event.ctrlKey) this.panXY(-event.deltaX * scaleX, -event.deltaY * scaleY);
-    else {
-      if (event.deltaX) this.state.yaw = wrapYaw(this.state.yaw - event.deltaX * scaleX * 0.005);
+    if (event.ctrlKey) {
       if (event.deltaY) {
         this.state.distance = clamp(this.state.distance * Math.exp(event.deltaY * scaleY * 0.001), 8, 700);
         this.maybeRebuildClusters();
       }
+    } else {
+      this.panXY(-event.deltaX * scaleX, -event.deltaY * scaleY);
     }
     if (!event.deltaX && !event.deltaY) return;
     this.invalidate();
@@ -696,6 +955,7 @@ class NeuronEngine {
   dispose() {
     this.resizeObserver.disconnect();
     cancelAnimationFrame(this.pendingFrame);
+    if (this.animationTimer) clearTimeout(this.animationTimer);
     if (this.wheelCommitTimer) {
       clearTimeout(this.wheelCommitTimer);
       this.callbacks.onCamera(structuredClone(this.state));
@@ -713,6 +973,8 @@ class NeuronEngine {
     this.disposeGraph();
     this.lineMaterial?.dispose();
     this.lineMaterial = null;
+    this.asteroidMaterial?.dispose();
+    this.asteroidMaterial = null;
     this.stars.geometry.dispose();
     (this.stars.material as THREE.Material).dispose();
     this.renderer.dispose();
@@ -723,8 +985,8 @@ export function NeuronCanvas(props: Props) {
   const canvasRef = useRef<HTMLCanvasElement>(null);
   const labelsRef = useRef<HTMLCanvasElement>(null);
   const engineRef = useRef<NeuronEngine | null>(null);
-  const callbacksRef = useRef({ onSelect: props.onSelect, onOpen: props.onOpen, onBackground: props.onBackground, onAnchor: props.onAnchor, onCommit: props.onCommit, onCamera: props.onCamera, onMetrics: props.onMetrics });
-  callbacksRef.current = { onSelect: props.onSelect, onOpen: props.onOpen, onBackground: props.onBackground, onAnchor: props.onAnchor, onCommit: props.onCommit, onCamera: props.onCamera, onMetrics: props.onMetrics };
+  const callbacksRef = useRef({ onSelect: props.onSelect, onLink: props.onLink, onOpen: props.onOpen, onBackground: props.onBackground, onAnchor: props.onAnchor, onCommit: props.onCommit, onCamera: props.onCamera, onMetrics: props.onMetrics });
+  callbacksRef.current = { onSelect: props.onSelect, onLink: props.onLink, onOpen: props.onOpen, onBackground: props.onBackground, onAnchor: props.onAnchor, onCommit: props.onCommit, onCamera: props.onCamera, onMetrics: props.onMetrics };
 
   useEffect(() => {
     const engine = new NeuronEngine(canvasRef.current!, labelsRef.current!, props.graph, callbacksRef.current);
