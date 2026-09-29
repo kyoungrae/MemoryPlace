@@ -19,8 +19,8 @@ type Props = {
 
 type Item = { id: string; title: string; position: Vec3; scale: number; color: string; node?: GraphNode; count: number };
 type Pointer = { x: number; y: number; sx: number; sy: number; hitId: string | null };
-type Asteroid = { sourceId: string; phase: number; orbit: number; size: number; free: boolean; color: string };
-type AsteroidHit = { asteroid: Asteroid; index: number; position: THREE.Vector3 };
+type Asteroid = { sourceId: string; angle: number; orbitFactor: number; sizeFactor: number; free: boolean; fresh: boolean; color: string };
+type AsteroidHit = { asteroid: Asteroid; index: number };
 
 const clamp = (value: number, min: number, max: number) => Math.max(min, Math.min(max, value));
 const vector = (value: Vec3) => new THREE.Vector3(value.x, value.y, value.z);
@@ -51,7 +51,7 @@ class NeuronEngine {
   private graph: Graph;
   private selectedId: string | null = null;
   private pointers = new Map<number, Pointer>();
-  private mode: 'rotate' | 'pan' | 'panXY' | 'drag' | 'linkDrag' | 'pinchCamera' | 'pinchNode' | null = null;
+  private mode: 'rotate' | 'pan' | 'drag' | 'linkDrag' | 'pinchCamera' | 'pinchNode' | null = null;
   private dragId: string | null = null;
   private dragPlane = new THREE.Plane();
   private dragOffset = new THREE.Vector3();
@@ -59,12 +59,11 @@ class NeuronEngine {
   private pinchStart = { distance: 1, cameraDistance: 1, nodeScale: 1, midpointX: 0, midpointY: 0 };
   private state: CameraState;
   private pendingFrame = 0;
-  private animationTimer: number | null = null;
+  private asteroidRevealStart: number | null = null;
   private frameTimes: number[] = [];
   private lastFrame = 0;
   private qualityScale = 1;
   private pointerActive = false;
-  private controlDown = false;
   private wheelCommitTimer: ReturnType<typeof setTimeout> | null = null;
   private labelContext: CanvasRenderingContext2D;
   private callbacks: Omit<Props, 'graph' | 'selectedId' | 'linking' | 'command'>;
@@ -105,9 +104,6 @@ class NeuronEngine {
     canvas.addEventListener('wheel', this.onWheel, { passive: false });
     canvas.addEventListener('dblclick', this.onDoubleClick);
     canvas.addEventListener('contextmenu', this.preventContextMenu);
-    window.addEventListener('keydown', this.onKeyDown);
-    window.addEventListener('keyup', this.onKeyUp);
-    window.addEventListener('blur', this.onWindowBlur);
     this.setGraph(graph);
     this.resize();
   }
@@ -182,6 +178,7 @@ class NeuronEngine {
     if (this.lineMesh) { this.scene.remove(this.lineMesh); this.lineMesh.geometry.dispose(); }
     if (this.asteroidMesh) { this.scene.remove(this.asteroidMesh); this.asteroidMesh.geometry.dispose(); }
     this.nodeMesh = null; this.haloMesh = null; this.lineMesh = null; this.asteroidMesh = null;
+    this.asteroidRevealStart = null;
     this.asteroidItems = []; this.linkAsteroidIndex = null; this.linkSourceId = null;
     this.clearLinkPreview();
     this.lineEndpoints.clear(); this.linePairs = [];
@@ -401,6 +398,8 @@ class NeuronEngine {
   }
 
   private buildAsteroids() {
+    const previousCounts = new Map<string, number>();
+    for (const asteroid of this.asteroidItems) previousCounts.set(asteroid.sourceId, (previousCounts.get(asteroid.sourceId) ?? 0) + 1);
     if (this.asteroidMesh) {
       this.scene.remove(this.asteroidMesh);
       this.asteroidMesh.geometry.dispose();
@@ -415,49 +414,42 @@ class NeuronEngine {
     for (const item of this.items) {
       if (!item.node) continue;
       const markers = degree.get(item.id) ?? 0;
+      const previousCount = previousCounts.get(item.id) ?? 0;
       const seed = hash(item.id);
       for (let marker = 0; marker <= markers; marker++) {
+        const ring = Math.floor(marker / 8);
         this.asteroidItems.push({
           sourceId: item.id,
-          phase: ((seed + marker * 137) % 628) / 100,
-          orbit: item.scale * (1.62 + marker * 0.46),
-          size: item.scale * (marker === markers ? 0.22 : 0.17),
+          angle: (seed % 628) / 100 + marker * 2.399963,
+          orbitFactor: 1.65 + ring * 0.53,
+          sizeFactor: marker === markers ? 0.22 : 0.17,
           free: marker === markers,
+          fresh: previousCount > 0 && marker >= previousCount,
           color: item.color,
         });
       }
     }
     if (!this.asteroidItems.length) return;
     const geometry = new THREE.PlaneGeometry(2, 2);
-    geometry.setAttribute('asteroidOrbit', new THREE.InstancedBufferAttribute(new Float32Array(this.asteroidItems.map(item => item.orbit)), 1).setUsage(THREE.DynamicDrawUsage));
-    geometry.setAttribute('asteroidPhase', new THREE.InstancedBufferAttribute(new Float32Array(this.asteroidItems.map(item => item.phase)), 1));
     geometry.setAttribute('asteroidFree', new THREE.InstancedBufferAttribute(new Float32Array(this.asteroidItems.map(item => item.free ? 1 : 0)), 1));
+    geometry.setAttribute('asteroidFresh', new THREE.InstancedBufferAttribute(new Float32Array(this.asteroidItems.map(item => item.fresh ? 1 : 0)), 1));
     const material = this.asteroidMaterial ?? new THREE.ShaderMaterial({
-      uniforms: {
-        uTime: { value: 0 },
-        uBirth: { value: 0 },
-      },
+      uniforms: { uReveal: { value: 1 } },
       vertexShader: `
-        attribute float asteroidOrbit;
-        attribute float asteroidPhase;
         attribute float asteroidFree;
-        uniform float uTime;
-        uniform float uBirth;
+        attribute float asteroidFresh;
         varying vec2 vCircle;
         varying vec3 vColor;
         varying float vFree;
-        varying float vReveal;
+        varying float vFresh;
         void main() {
           vec4 center = modelViewMatrix * instanceMatrix * vec4(0.0, 0.0, 0.0, 1.0);
-          float angle = uTime * (0.9 + asteroidFree * 0.35) + asteroidPhase;
-          center.xy += vec2(cos(angle), sin(angle * 1.17)) * asteroidOrbit;
-          center.z += sin(angle * 1.9 + asteroidPhase) * asteroidOrbit * 0.16;
           float radius = length((instanceMatrix * vec4(1.0, 0.0, 0.0, 0.0)).xyz);
           center.xy += position.xy * radius;
           vCircle = position.xy;
           vColor = instanceColor;
           vFree = asteroidFree;
-          vReveal = smoothstep(0.0, 0.42, uTime - uBirth - fract(asteroidPhase) * 0.14);
+          vFresh = asteroidFresh;
           gl_Position = projectionMatrix * center;
         }
       `,
@@ -465,7 +457,8 @@ class NeuronEngine {
         varying vec2 vCircle;
         varying vec3 vColor;
         varying float vFree;
-        varying float vReveal;
+        varying float vFresh;
+        uniform float uReveal;
         void main() {
           float r = length(vCircle);
           float edge = max(fwidth(r), 0.001);
@@ -473,7 +466,7 @@ class NeuronEngine {
           if (alpha < 0.001) discard;
           float core = exp(-r * r * 5.0);
           vec3 color = mix(vColor * 0.48, vec3(0.72, 1.0, 0.92), vFree * (0.48 + core * 0.32));
-          gl_FragColor = vec4(color * (0.7 + core * 0.48), alpha * vReveal * (0.55 + vFree * 0.34));
+          gl_FragColor = vec4(color * (0.7 + core * 0.48), alpha * (0.55 + vFree * 0.34) * mix(1.0, uReveal, vFresh));
           #include <tonemapping_fragment>
           #include <colorspace_fragment>
         }
@@ -484,7 +477,8 @@ class NeuronEngine {
       side: THREE.DoubleSide,
     });
     this.asteroidMaterial = material;
-    material.uniforms.uBirth.value = performance.now() * 0.001;
+    this.asteroidRevealStart = this.asteroidItems.some(item => item.fresh) ? performance.now() : null;
+    material.uniforms.uReveal.value = this.asteroidRevealStart === null ? 1 : 0;
     const mesh = new THREE.InstancedMesh(geometry, material, this.asteroidItems.length);
     mesh.instanceMatrix.setUsage(THREE.DynamicDrawUsage);
     mesh.frustumCulled = false;
@@ -496,10 +490,19 @@ class NeuronEngine {
     this.scene.add(mesh);
   }
 
+  private asteroidWorldPosition(asteroid: Asteroid, result: THREE.Vector3) {
+    const source = this.nodes.get(asteroid.sourceId);
+    if (!source) return result.set(0, 0, 0);
+    const orbit = source.scale * asteroid.orbitFactor;
+    return result.set(
+      source.x + Math.cos(asteroid.angle) * orbit,
+      source.y + Math.sin(asteroid.angle) * orbit,
+      source.z + Math.sin(asteroid.angle * 1.7) * source.scale * 0.1,
+    );
+  }
   private writeAsteroidMatrix(index: number, asteroid: Asteroid, position?: THREE.Vector3) {
-    const source = position ?? (this.nodes.has(asteroid.sourceId) ? vector(this.nodes.get(asteroid.sourceId)!) : new THREE.Vector3());
-    this.tempObject.position.copy(source);
-    this.tempObject.scale.setScalar(asteroid.size);
+    this.tempObject.position.copy(position ?? this.asteroidWorldPosition(asteroid, new THREE.Vector3()));
+    this.tempObject.scale.setScalar((this.nodes.get(asteroid.sourceId)?.scale ?? 1) * asteroid.sizeFactor);
     this.tempObject.updateMatrix();
     this.asteroidMesh?.setMatrixAt(index, this.tempObject.matrix);
   }
@@ -645,7 +648,12 @@ class NeuronEngine {
   private render = (time: number) => {
     this.pendingFrame = 0;
     this.updateCamera();
-    if (this.asteroidMaterial) this.asteroidMaterial.uniforms.uTime.value = time * 0.001;
+    if (this.asteroidRevealStart !== null && this.asteroidMaterial) {
+      const progress = Math.min(1, (time - this.asteroidRevealStart) / 350);
+      this.asteroidMaterial.uniforms.uReveal.value = progress * (2 - progress);
+      if (progress < 1) this.invalidate();
+      else this.asteroidRevealStart = null;
+    }
     this.renderer.render(this.scene, this.camera);
     this.drawLabels();
     if (this.pointerActive && this.lastFrame) {
@@ -660,12 +668,6 @@ class NeuronEngine {
     }
     this.lastFrame = time;
     if (this.pointerActive) this.invalidate();
-    else if (this.asteroidMesh && document.visibilityState === 'visible' && !this.animationTimer) {
-      this.animationTimer = window.setTimeout(() => {
-        this.animationTimer = null;
-        this.invalidate();
-      }, 32);
-    }
   };
   private invalidate() { if (!this.pendingFrame) this.pendingFrame = requestAnimationFrame(this.render); }
 
@@ -691,38 +693,25 @@ class NeuronEngine {
     }
     return nearest;
   }
-  private asteroidWorldPosition(asteroid: Asteroid, time: number, right: THREE.Vector3, up: THREE.Vector3, forward: THREE.Vector3, result: THREE.Vector3) {
-    const source = this.nodes.get(asteroid.sourceId);
-    if (!source) return result.set(0, 0, 0);
-    const angle = time * (0.9 + (asteroid.free ? 0.35 : 0)) + asteroid.phase;
-    return result.set(source.x, source.y, source.z)
-      .addScaledVector(right, Math.cos(angle) * asteroid.orbit)
-      .addScaledVector(up, Math.sin(angle * 1.17) * asteroid.orbit)
-      .addScaledVector(forward, -Math.sin(angle * 1.9 + asteroid.phase) * asteroid.orbit * 0.16);
-  }
   private pickAsteroid(x: number, y: number): AsteroidHit | null {
     if (!this.asteroidMesh) return null;
     const rect = this.canvas.getBoundingClientRect();
     this.updateCamera();
     const focal = 1 / Math.tan(THREE.MathUtils.degToRad(this.camera.fov) / 2);
-    const right = new THREE.Vector3().setFromMatrixColumn(this.camera.matrix, 0);
-    const up = new THREE.Vector3().setFromMatrixColumn(this.camera.matrix, 1);
-    const forward = this.camera.getWorldDirection(new THREE.Vector3());
     const world = new THREE.Vector3();
     const view = new THREE.Vector3();
     let result: AsteroidHit | null = null;
     let nearestDepth = Infinity;
-    const time = performance.now() * 0.001;
     this.asteroidItems.forEach((asteroid, index) => {
-      this.asteroidWorldPosition(asteroid, time, right, up, forward, world);
+      this.asteroidWorldPosition(asteroid, world);
       view.copy(world).applyMatrix4(this.camera.matrixWorldInverse);
       const depth = -view.z;
       if (depth <= this.camera.near || depth >= this.camera.far || depth >= nearestDepth) return;
       const screenX = rect.left + (1 + view.x * focal / (this.camera.aspect * depth)) * rect.width / 2;
       const screenY = rect.top + (1 - view.y * focal / depth) * rect.height / 2;
-      const radius = Math.max(10, asteroid.size * focal * rect.height * 1.25 / depth);
+      const radius = Math.max(10, (this.nodes.get(asteroid.sourceId)?.scale ?? 1) * asteroid.sizeFactor * focal * rect.height * 1.25 / depth);
       if (Math.hypot(screenX - x, screenY - y) <= radius) {
-        result = { asteroid, index, position: world.clone() };
+        result = { asteroid, index };
         nearestDepth = depth;
       }
     });
@@ -752,13 +741,7 @@ class NeuronEngine {
     this.refreshColors();
     this.refreshLineColors();
     this.refreshAsteroidColors();
-    this.dragPlane.setFromNormalAndCoplanarPoint(this.camera.getWorldDirection(new THREE.Vector3()), vector(source));
-    const orbit = this.asteroidMesh?.geometry.getAttribute('asteroidOrbit') as THREE.InstancedBufferAttribute | undefined;
-    if (orbit) {
-      orbit.setX(hit.index, 0);
-      orbit.addUpdateRange(hit.index, 1);
-      orbit.needsUpdate = true;
-    }
+    this.dragPlane.setFromNormalAndCoplanarPoint(this.camera.getWorldDirection(new THREE.Vector3()), this.asteroidWorldPosition(hit.asteroid, new THREE.Vector3()));
     this.moveLinkDrag(event.clientX, event.clientY);
   }
   private moveLinkDrag(x: number, y: number) {
@@ -821,7 +804,7 @@ class NeuronEngine {
       const point = this.pointOnPlane(event.clientX, event.clientY);
       this.dragOffset.copy(point ? vector(hit.position).sub(point) : new THREE.Vector3());
       this.invalidate();
-    } else { this.dragId = null; this.mode = 'panXY'; }
+    } else { this.dragId = null; this.mode = 'pan'; }
   };
   private onPointerMove = (event: PointerEvent) => {
     const pointer = this.pointers.get(event.pointerId);
@@ -845,8 +828,8 @@ class NeuronEngine {
     }
     if (Math.hypot(pointer.x - pointer.sx, pointer.y - pointer.sy) > 3) this.moved = true;
     if (this.mode === 'linkDrag') { this.moveLinkDrag(event.clientX, event.clientY); return; }
-    if (this.mode === 'rotate' && !event.ctrlKey) this.mode = 'panXY';
-    else if (this.mode === 'panXY' && event.ctrlKey) this.mode = 'rotate';
+    if (this.mode === 'rotate' && !event.ctrlKey) this.mode = 'pan';
+    else if (this.mode === 'pan' && event.ctrlKey) this.mode = 'rotate';
     if (this.mode === 'drag' && this.dragId && this.moved && !this.linking) {
       const point = this.pointOnPlane(event.clientX, event.clientY);
       if (point) this.updateNode(this.dragId, { x: point.x + this.dragOffset.x, y: point.y + this.dragOffset.y, z: point.z + this.dragOffset.z });
@@ -856,20 +839,14 @@ class NeuronEngine {
       this.invalidate();
     } else if (this.mode === 'pan') {
       this.pan(dx, dy); this.invalidate();
-    } else if (this.mode === 'panXY') {
-      this.panXY(dx, dy); this.invalidate();
     }
   };
-  private panXY(dx: number, dy: number) {
-    const scale = this.state.distance * 0.0018;
-    this.state.target.x += dx * scale;
-    this.state.target.y -= dy * scale;
-  }
   private pan(dx: number, dy: number) {
     this.updateCamera();
     const right = new THREE.Vector3().setFromMatrixColumn(this.camera.matrix, 0);
     const up = new THREE.Vector3().setFromMatrixColumn(this.camera.matrix, 1);
-    const scale = this.state.distance * 0.0018;
+    const height = this.canvas.getBoundingClientRect().height || 1;
+    const scale = 2 * this.state.distance * Math.tan(THREE.MathUtils.degToRad(this.camera.fov) / 2) / height;
     this.state.target.x += (-right.x * dx + up.x * dy) * scale;
     this.state.target.y += (-right.y * dx + up.y * dy) * scale;
     this.state.target.z += (-right.z * dx + up.z * dy) * scale;
@@ -909,7 +886,7 @@ class NeuronEngine {
         this.maybeRebuildClusters();
       }
     } else {
-      this.panXY(-event.deltaX * scaleX, -event.deltaY * scaleY);
+      this.pan(-event.deltaX * scaleX, -event.deltaY * scaleY);
     }
     if (!event.deltaX && !event.deltaY) return;
     this.invalidate();
@@ -920,9 +897,6 @@ class NeuronEngine {
       this.callbacks.onCamera(structuredClone(this.state));
     }, 120);
   };
-  private onKeyDown = (event: KeyboardEvent) => { if (event.key === 'Control' || event.ctrlKey) this.controlDown = true; };
-  private onKeyUp = (event: KeyboardEvent) => { if (event.key === 'Control' || !event.ctrlKey) this.controlDown = false; };
-  private onWindowBlur = () => { this.controlDown = false; };
   private onDoubleClick = (event: MouseEvent) => {
     const hit = this.pick(event.clientX, event.clientY);
     if (hit?.node) this.callbacks.onOpen(hit.id);
@@ -955,7 +929,6 @@ class NeuronEngine {
   dispose() {
     this.resizeObserver.disconnect();
     cancelAnimationFrame(this.pendingFrame);
-    if (this.animationTimer) clearTimeout(this.animationTimer);
     if (this.wheelCommitTimer) {
       clearTimeout(this.wheelCommitTimer);
       this.callbacks.onCamera(structuredClone(this.state));
@@ -967,9 +940,6 @@ class NeuronEngine {
     this.canvas.removeEventListener('wheel', this.onWheel);
     this.canvas.removeEventListener('dblclick', this.onDoubleClick);
     this.canvas.removeEventListener('contextmenu', this.preventContextMenu);
-    window.removeEventListener('keydown', this.onKeyDown);
-    window.removeEventListener('keyup', this.onKeyUp);
-    window.removeEventListener('blur', this.onWindowBlur);
     this.disposeGraph();
     this.lineMaterial?.dispose();
     this.lineMaterial = null;

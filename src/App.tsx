@@ -468,7 +468,7 @@ export function App() {
         <div className="graph-glow graph-glow-a" /><div className="graph-glow graph-glow-b" />
         <Suspense fallback={<div className="graph-loading">3D 공간을 준비하고 있어요…</div>}><NeuronCanvas graph={graph} selectedId={selectedId} linking={linking} command={command} onSelect={(id, anchor) => void selectNode(id, false, anchor)} onLink={(sourceId, targetId) => void linkNodes(sourceId, targetId)} onOpen={id => void selectNode(id, true)} onBackground={dismissPanel} onAnchor={updatePanelAnchor} onCommit={commitNode} onCamera={onCamera} onMetrics={setMetrics} /></Suspense>
         <div className="graph-caption"><div className="live-dot" /><span>NEURAL SPACE</span><strong>{graph.totalNodes}개의 생각 · {graph.edges.length}개의 연결</strong></div>
-        <div className="graph-help">{linking ? '연결할 다른 노드를 선택하세요' : '트랙패드·드래그: 2D 이동 · Ctrl+드래그: 3D 시점 회전 · 떠다니는 구체를 다른 뉴런으로 드래그해 연결'}</div>
+        <div className="graph-help">{linking ? '연결할 다른 노드를 선택하세요' : '트랙패드·드래그: 화면 방향 이동 · Ctrl+드래그: 3D 시점 회전 · 뉴런 옆 구체를 다른 뉴런으로 드래그해 연결'}</div>
         <div className="graph-controls"><button onClick={() => setCommand({ id: Date.now(), type: 'in' })} aria-label="확대">＋</button><button onClick={() => setCommand({ id: Date.now(), type: 'out' })} aria-label="축소">−</button><span /><button onClick={() => setCommand({ id: Date.now(), type: 'fit' })} aria-label="전체 보기">◎</button></div>
         {panel && panelNode && <div ref={panelRef} key={panel.nodeId} className={`node-panel panel-${panel.phase}`}>
           <div className="panel-topline">
