@@ -62,6 +62,8 @@ class NeuronEngine {
   private pinchStart = { distance: 1, cameraDistance: 1, nodeScale: 1, midpointX: 0, midpointY: 0 };
   private state: CameraState;
   private pendingFrame = 0;
+  private animationTimer: number | null = null;
+  private labelsDirty = true;
   private asteroidRevealStart: number | null = null;
   private frameTimes: number[] = [];
   private lastFrame = 0;
@@ -107,6 +109,7 @@ class NeuronEngine {
     canvas.addEventListener('wheel', this.onWheel, { passive: false });
     canvas.addEventListener('dblclick', this.onDoubleClick);
     canvas.addEventListener('contextmenu', this.preventContextMenu);
+    document.addEventListener('visibilitychange', this.onVisibilityChange);
     this.setGraph(graph);
     this.resize();
   }
@@ -207,8 +210,10 @@ class NeuronEngine {
     const geometry = new THREE.PlaneGeometry(2, 2);
     geometry.setAttribute('planetSeed', new THREE.InstancedBufferAttribute(new Float32Array(this.items.map(item => (hash(item.id) % 997) / 997)), 1));
     const material = new THREE.ShaderMaterial({
+      uniforms: { uTime: { value: 0 } },
       vertexShader: `attribute float planetSeed; varying vec3 vColor; varying float vSeed; ${circleVertex.replace('vCircle = position.xy;', 'vCircle = position.xy; vColor = instanceColor; vSeed = planetSeed;')}`,
       fragmentShader: `
+        uniform float uTime;
         varying vec2 vCircle;
         varying vec3 vColor;
         varying float vSeed;
@@ -235,29 +240,22 @@ class NeuronEngine {
           float light = 0.5 + 0.5 * dot(normal, normalize(vec3(-0.48, 0.62, 0.7)));
           float rim = exp(-pow((r - 0.975) * 41.0, 2.0)) * (0.28 + 0.22 * light);
           float reflection = exp(-dot(point - vec2(-0.45, 0.47), point - vec2(-0.45, 0.47)) * 5.0) * 0.24;
-          float shellOneDistance = length(point - vec2(-0.14, 0.04)) - 0.55;
-          float shellTwoDistance = length(point - vec2(0.22, -0.11)) - 0.47;
-          float shells = exp(-pow(shellOneDistance * 18.0, 2.0)) * 0.17;
-          shells += exp(-pow(shellTwoDistance * 18.0, 2.0)) * 0.14;
-          float shellFill = (1.0 - smoothstep(-0.08, 0.06, shellOneDistance)) * 0.11;
-          shellFill += (1.0 - smoothstep(-0.08, 0.06, shellTwoDistance)) * 0.08;
+          vec2 aroundCore = point - vec2(0.03, -0.01);
+          float shellDistance = length(aroundCore) - 0.57;
+          float shellPulse = 0.82 + 0.18 * sin(uTime * 0.6 + vSeed * 6.283185);
+          float shell = exp(-pow(shellDistance * 13.0, 2.0)) * 0.11 * shellPulse;
+          float shellFill = (1.0 - smoothstep(-0.08, 0.07, shellDistance)) * 0.07;
           float detail = 1.0 - smoothstep(0.018, 0.052, fwidth(point.x));
           float filaments = 0.0, stars = 0.0;
           if (detail > 0.01) {
-            vec2 spun = turn(point, vSeed * 6.283185);
-            filaments = orbit(turn(point - vec2(-0.08, 0.12), 0.32 + vSeed * 0.28), vec2(0.76, 0.37)) * 0.17;
-            filaments += orbit(turn(point - vec2(0.12, -0.09), -0.8 + vSeed * 0.24), vec2(0.64, 0.42)) * 0.13;
-            filaments += orbit(turn(point - vec2(0.05, 0.03), 1.12 - vSeed * 0.2), vec2(0.69, 0.27)) * 0.10;
+            float firstAngle = uTime * 0.23 + vSeed * 6.283185;
+            float secondAngle = -uTime * 0.17 + vSeed * 6.283185 + 1.2;
+            filaments = orbit(turn(aroundCore, firstAngle), vec2(0.72, 0.36)) * 0.18;
+            filaments += orbit(turn(aroundCore, secondAngle), vec2(0.58, 0.46)) * 0.13;
             filaments *= detail;
-            stars = spark(spun, vec2(-0.73, 0.25), 0.019);
-            stars += spark(spun, vec2(0.57, 0.49), 0.016);
-            stars += spark(spun, vec2(-0.35, -0.69), 0.015);
-            stars += spark(spun, vec2(0.77, -0.26), 0.018);
-            stars += spark(spun, vec2(0.12, 0.74), 0.013);
-            stars += spark(spun, vec2(-0.53, -0.28), 0.012) * 0.52;
-            stars += spark(spun, vec2(0.37, -0.55), 0.012) * 0.52;
-            stars += spark(spun, vec2(0.43, 0.10), 0.011) * 0.42;
-            stars = min(stars, 1.0) * detail * 0.82;
+            vec2 firstSpark = turn(vec2(0.72 * cos(uTime * 0.37), 0.36 * sin(uTime * 0.37)), -firstAngle);
+            vec2 secondSpark = turn(vec2(0.58 * cos(-uTime * 0.29 + 2.1), 0.46 * sin(-uTime * 0.29 + 2.1)), -secondAngle);
+            stars = (spark(aroundCore, firstSpark, 0.019) * 0.8 + spark(aroundCore, secondSpark, 0.015) * 0.6) * detail;
           }
           float coreDistance = length(point - vec2(0.03, -0.01));
           float corePattern = 0.5;
@@ -265,7 +263,7 @@ class NeuronEngine {
           float core = (1.0 - smoothstep(0.16, 0.24, coreDistance)) * (0.42 + corePattern * detail * 0.15);
           core += stroke(coreDistance - 0.235, 0.014) * 0.26;
           core += exp(-dot(point - vec2(-0.04, 0.06), point - vec2(-0.04, 0.06)) * 95.0) * 0.22;
-          float alpha = sphere * clamp(0.045 + light * 0.06 + rim + reflection + shellFill + shells + filaments + stars + core, 0.0, 0.92);
+          float alpha = sphere * clamp(0.045 + light * 0.06 + rim + reflection + shellFill + shell + filaments + stars + core, 0.0, 0.92);
           vec3 tint = mix(vec3(0.88, 0.93, 1.0), vColor, 0.18);
           vec3 color = mix(tint, vec3(1.0), clamp(rim + filaments + stars + core, 0.0, 1.0) * 0.64);
           gl_FragColor = vec4(color, alpha);
@@ -709,6 +707,10 @@ class NeuronEngine {
   private render = (time: number) => {
     this.pendingFrame = 0;
     this.updateCamera();
+    const animateShells = Boolean(this.nodeMesh) && this.state.distance < 100
+      && document.visibilityState === 'visible'
+      && !window.matchMedia('(prefers-reduced-motion: reduce)').matches;
+    if (this.nodeMesh) (this.nodeMesh.material as THREE.ShaderMaterial).uniforms.uTime.value = animateShells ? time * 0.001 : 0;
     if (this.asteroidRevealStart !== null && this.asteroidMaterial) {
       const progress = Math.min(1, (time - this.asteroidRevealStart) / 350);
       this.asteroidMaterial.uniforms.uReveal.value = progress * (2 - progress);
@@ -716,7 +718,7 @@ class NeuronEngine {
       else this.asteroidRevealStart = null;
     }
     this.renderer.render(this.scene, this.camera);
-    this.drawLabels();
+    if (this.labelsDirty) { this.drawLabels(); this.labelsDirty = false; }
     if (this.pointerActive && this.lastFrame) {
       this.frameTimes.push(time - this.lastFrame);
       if (this.frameTimes.length > 100) this.frameTimes.shift();
@@ -729,8 +731,23 @@ class NeuronEngine {
     }
     this.lastFrame = time;
     if (this.pointerActive) this.invalidate();
+    else if (animateShells && this.animationTimer === null) {
+      this.animationTimer = window.setTimeout(() => {
+        this.animationTimer = null;
+        this.invalidate(false);
+      }, window.innerWidth < 700 ? 42 : 26);
+    }
   };
-  private invalidate() { if (!this.pendingFrame) this.pendingFrame = requestAnimationFrame(this.render); }
+  private invalidate(labels = true) {
+    if (labels) this.labelsDirty = true;
+    if (!this.pendingFrame) this.pendingFrame = requestAnimationFrame(this.render);
+  }
+  private onVisibilityChange = () => {
+    if (document.visibilityState === 'hidden') {
+      if (this.animationTimer !== null) clearTimeout(this.animationTimer);
+      this.animationTimer = null;
+    } else this.invalidate(false);
+  };
 
   private pick(x: number, y: number): Item | null {
     if (!this.nodeMesh) return null;
@@ -1036,6 +1053,8 @@ class NeuronEngine {
   dispose() {
     this.resizeObserver.disconnect();
     cancelAnimationFrame(this.pendingFrame);
+    if (this.animationTimer !== null) clearTimeout(this.animationTimer);
+    document.removeEventListener('visibilitychange', this.onVisibilityChange);
     if (this.wheelCommitTimer) {
       clearTimeout(this.wheelCommitTimer);
       this.callbacks.onCamera(structuredClone(this.state));
