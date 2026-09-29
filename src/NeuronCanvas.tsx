@@ -21,6 +21,7 @@ type Item = { id: string; title: string; position: Vec3; scale: number; color: s
 type Pointer = { x: number; y: number; sx: number; sy: number; hitId: string | null };
 type Asteroid = { sourceId: string; angle: number; orbitFactor: number; sizeFactor: number; free: boolean; fresh: boolean; color: string };
 type AsteroidHit = { asteroid: Asteroid; index: number };
+type MagneticTarget = { item: Item; strength: number };
 
 const clamp = (value: number, min: number, max: number) => Math.max(min, Math.min(max, value));
 const vector = (value: Vec3) => new THREE.Vector3(value.x, value.y, value.z);
@@ -42,6 +43,8 @@ class NeuronEngine {
   private linkPreview: THREE.Line | null = null;
   private linkAsteroidIndex: number | null = null;
   private linkSourceId: string | null = null;
+  private magnetTargetId: string | null = null;
+  private linkedTargets = new Set<string>();
   private stars: THREE.Points;
   private items: Item[] = [];
   private itemById = new Map<string, number>();
@@ -180,6 +183,7 @@ class NeuronEngine {
     this.nodeMesh = null; this.haloMesh = null; this.lineMesh = null; this.asteroidMesh = null;
     this.asteroidRevealStart = null;
     this.asteroidItems = []; this.linkAsteroidIndex = null; this.linkSourceId = null;
+    this.magnetTargetId = null; this.linkedTargets.clear();
     this.clearLinkPreview();
     this.lineEndpoints.clear(); this.linePairs = [];
   }
@@ -529,7 +533,7 @@ class NeuronEngine {
     if (!this.linkPreview) {
       const geometry = new THREE.BufferGeometry();
       geometry.setAttribute('position', new THREE.Float32BufferAttribute([source.x, source.y, source.z, target.x, target.y, target.z], 3));
-      this.linkPreview = new THREE.Line(geometry, new THREE.LineBasicMaterial({ color: 0x8cffe0, transparent: true, opacity: 0.8, depthWrite: false }));
+      this.linkPreview = new THREE.Line(geometry, new THREE.LineBasicMaterial({ color: this.magnetTargetId ? 0xb9ffe0 : 0x8cffe0, transparent: true, opacity: this.magnetTargetId ? 1 : 0.8, depthWrite: false }));
       this.linkPreview.renderOrder = 4;
       this.scene.add(this.linkPreview);
       return;
@@ -538,6 +542,9 @@ class NeuronEngine {
     positions.setXYZ(0, source.x, source.y, source.z);
     positions.setXYZ(1, target.x, target.y, target.z);
     positions.needsUpdate = true;
+    const material = this.linkPreview.material as THREE.LineBasicMaterial;
+    material.color.setHex(this.magnetTargetId ? 0xb9ffe0 : 0x8cffe0);
+    material.opacity = this.magnetTargetId ? 1 : 0.8;
   }
 
   private writeMatrix(index: number, item: Item) {
@@ -553,7 +560,7 @@ class NeuronEngine {
   private refreshColors() {
     if (!this.nodeMesh) return;
     this.items.forEach((item, index) => {
-      this.tempColor.set(item.id === this.selectedId ? '#e9fff7' : item.color);
+      this.tempColor.set(item.id === this.magnetTargetId ? '#b9ffe0' : item.id === this.selectedId ? '#e9fff7' : item.color);
       this.nodeMesh!.setColorAt(index, this.tempColor);
       this.haloMesh?.setColorAt(index, this.tempColor);
     });
@@ -717,6 +724,32 @@ class NeuronEngine {
     });
     return result;
   }
+  private pickMagneticTarget(sourceId: string, x: number, y: number): MagneticTarget | null {
+    const rect = this.canvas.getBoundingClientRect();
+    this.updateCamera();
+    const focal = 1 / Math.tan(THREE.MathUtils.degToRad(this.camera.fov) / 2);
+    const view = new THREE.Vector3();
+    let nearest: MagneticTarget | null = null;
+    let nearestScore = Infinity;
+    for (const item of this.items) {
+      if (!item.node || item.id === sourceId || this.linkedTargets.has(item.id)) continue;
+      view.set(item.position.x, item.position.y, item.position.z).applyMatrix4(this.camera.matrixWorldInverse);
+      const depth = -view.z;
+      if (depth <= this.camera.near || depth >= this.camera.far) continue;
+      const screenX = rect.left + (1 + view.x * focal / (this.camera.aspect * depth)) * rect.width / 2;
+      const screenY = rect.top + (1 - view.y * focal / depth) * rect.height / 2;
+      const radius = Math.max(8, item.scale * 0.88 * focal * rect.height / (2 * depth));
+      const captureRadius = radius + 36 + (item.id === this.magnetTargetId ? 16 : 0);
+      const distance = Math.hypot(screenX - x, screenY - y);
+      if (distance > captureRadius) continue;
+      const score = Math.max(0, distance - radius) + distance * 0.03;
+      if (score >= nearestScore) continue;
+      const pull = clamp((captureRadius - distance) / (captureRadius - radius), 0, 1);
+      nearest = { item, strength: pull * pull * (3 - 2 * pull) };
+      nearestScore = score;
+    }
+    return nearest;
+  }
   private pointOnPlane(x: number, y: number): THREE.Vector3 | null {
     const rect = this.canvas.getBoundingClientRect();
     this.raycaster.setFromCamera(new THREE.Vector2(((x - rect.left) / rect.width) * 2 - 1, -((y - rect.top) / rect.height) * 2 + 1), this.camera);
@@ -737,6 +770,11 @@ class NeuronEngine {
     this.dragId = null;
     this.linkAsteroidIndex = hit.index;
     this.linkSourceId = hit.asteroid.sourceId;
+    this.linkedTargets.clear();
+    for (const edge of this.graph.edges) {
+      if (edge.sourceNodeId === hit.asteroid.sourceId) this.linkedTargets.add(edge.targetNodeId);
+      else if (edge.targetNodeId === hit.asteroid.sourceId) this.linkedTargets.add(edge.sourceNodeId);
+    }
     this.selectedId = hit.asteroid.sourceId;
     this.refreshColors();
     this.refreshLineColors();
@@ -750,6 +788,17 @@ class NeuronEngine {
     const asteroid = this.asteroidItems[this.linkAsteroidIndex];
     const point = this.pointOnPlane(x, y);
     if (!source || !asteroid || !point) return;
+    const magnetic = this.pickMagneticTarget(this.linkSourceId, x, y);
+    const targetId = magnetic?.item.id ?? null;
+    if (targetId !== this.magnetTargetId) {
+      this.magnetTargetId = targetId;
+      this.refreshColors();
+    }
+    if (magnetic) {
+      const target = vector(magnetic.item.position);
+      const towardSource = vector(source).sub(target).normalize();
+      point.lerp(target.addScaledVector(towardSource, magnetic.item.scale * 0.88), magnetic.strength);
+    }
     this.writeAsteroidMatrix(this.linkAsteroidIndex, asteroid, point);
     if (this.asteroidMesh) this.asteroidMesh.instanceMatrix.needsUpdate = true;
     this.updateLinkPreview(source, point);
@@ -757,12 +806,16 @@ class NeuronEngine {
   }
   private finishLinkDrag(x: number, y: number, shouldLink: boolean) {
     const sourceId = this.linkSourceId;
-    const target = shouldLink ? this.pick(x, y) : null;
+    const target = sourceId && shouldLink ? this.pickMagneticTarget(sourceId, x, y)?.item ?? this.pick(x, y) : null;
+    const canLink = !!sourceId && !!target?.node && target.id !== sourceId && !this.linkedTargets.has(target.id);
     this.linkAsteroidIndex = null;
     this.linkSourceId = null;
+    this.magnetTargetId = null;
+    this.linkedTargets.clear();
     this.clearLinkPreview();
     this.buildAsteroids();
-    if (sourceId && target?.node && target.id !== sourceId) this.callbacks.onLink(sourceId, target.id);
+    this.refreshColors();
+    if (canLink && sourceId && target) this.callbacks.onLink(sourceId, target.id);
     this.invalidate();
   }
 
