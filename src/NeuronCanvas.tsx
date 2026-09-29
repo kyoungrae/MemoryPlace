@@ -212,34 +212,69 @@ class NeuronEngine {
         varying vec2 vCircle;
         varying vec3 vColor;
         varying float vSeed;
+        vec2 turn(vec2 point, float angle) {
+          float s = sin(angle), c = cos(angle);
+          return vec2(point.x * c - point.y * s, point.x * s + point.y * c);
+        }
+        float stroke(float distance, float width) {
+          return 1.0 - smoothstep(width, width + max(fwidth(distance), 0.002), abs(distance));
+        }
+        float orbit(vec2 point, vec2 radii) {
+          return stroke(length(point / radii) - 1.0, 0.008);
+        }
+        float spark(vec2 point, vec2 center, float size) {
+          return 1.0 - smoothstep(size, size + max(fwidth(point.x), 0.002), length(point - center));
+        }
         void main() {
-          float r = length(vCircle);
+          vec2 point = vCircle;
+          float r = length(point);
           float edge = max(fwidth(r), 0.001);
-          float alpha = 1.0 - smoothstep(1.0 - edge, 1.0 + edge, r);
-          if (alpha < 0.001) discard;
-          vec3 normal = normalize(vec3(vCircle, sqrt(max(0.0, 1.0 - min(r, 1.0) * min(r, 1.0)))));
-          vec3 light = normalize(vec3(-0.58, 0.72, 0.68));
-          float facing = dot(normal, light);
-          float daylight = smoothstep(-0.35, 0.65, facing);
-          float latitude = normal.y + sin(normal.x * 3.4 + vSeed * 6.0) * 0.09;
-          float bands = 0.5 + 0.5 * sin(latitude * 9.0 + vSeed * 2.4);
-          float clouds = sin(normal.x * 4.2 + sin(normal.y * 3.0 + vSeed * 6.3) * 1.1) * 0.65;
-          clouds += sin(normal.y * 5.1 + normal.z * 2.8 + vSeed * 4.2) * 0.35;
-          float surface = smoothstep(-0.45, 0.85, clouds);
-          vec3 albedo = mix(vColor * 0.56, vColor * 0.88, surface * 0.75 + bands * 0.20);
-          albedo = mix(albedo, mix(vColor, vec3(0.94, 0.97, 1.0), 0.12), bands * 0.11);
-          vec3 color = albedo * (0.20 + 0.84 * daylight);
-          float glint = pow(max(dot(reflect(-light, normal), vec3(0.0, 0.0, 1.0)), 0.0), 24.0);
-          color += vec3(0.84, 0.94, 1.0) * glint * 0.09;
-          float atmosphere = pow(1.0 - normal.z, 2.5);
-          color += mix(vColor, vec3(0.65, 0.86, 1.0), 0.32) * atmosphere * 0.28;
-          gl_FragColor = vec4(color, alpha * (0.84 + normal.z * 0.10));
+          float sphere = 1.0 - smoothstep(1.0 - edge, 1.0 + edge, r);
+          if (sphere < 0.001) discard;
+          vec3 normal = normalize(vec3(point, sqrt(max(0.0, 1.0 - min(r, 1.0) * min(r, 1.0)))));
+          float light = 0.5 + 0.5 * dot(normal, normalize(vec3(-0.48, 0.62, 0.7)));
+          float rim = exp(-pow((r - 0.975) * 41.0, 2.0)) * (0.28 + 0.22 * light);
+          float reflection = exp(-dot(point - vec2(-0.45, 0.47), point - vec2(-0.45, 0.47)) * 5.0) * 0.24;
+          float shellOneDistance = length(point - vec2(-0.14, 0.04)) - 0.55;
+          float shellTwoDistance = length(point - vec2(0.22, -0.11)) - 0.47;
+          float shells = exp(-pow(shellOneDistance * 18.0, 2.0)) * 0.17;
+          shells += exp(-pow(shellTwoDistance * 18.0, 2.0)) * 0.14;
+          float shellFill = (1.0 - smoothstep(-0.08, 0.06, shellOneDistance)) * 0.11;
+          shellFill += (1.0 - smoothstep(-0.08, 0.06, shellTwoDistance)) * 0.08;
+          float detail = 1.0 - smoothstep(0.018, 0.052, fwidth(point.x));
+          float filaments = 0.0, stars = 0.0;
+          if (detail > 0.01) {
+            vec2 spun = turn(point, vSeed * 6.283185);
+            filaments = orbit(turn(point - vec2(-0.08, 0.12), 0.32 + vSeed * 0.28), vec2(0.76, 0.37)) * 0.17;
+            filaments += orbit(turn(point - vec2(0.12, -0.09), -0.8 + vSeed * 0.24), vec2(0.64, 0.42)) * 0.13;
+            filaments += orbit(turn(point - vec2(0.05, 0.03), 1.12 - vSeed * 0.2), vec2(0.69, 0.27)) * 0.10;
+            filaments *= detail;
+            stars = spark(spun, vec2(-0.73, 0.25), 0.019);
+            stars += spark(spun, vec2(0.57, 0.49), 0.016);
+            stars += spark(spun, vec2(-0.35, -0.69), 0.015);
+            stars += spark(spun, vec2(0.77, -0.26), 0.018);
+            stars += spark(spun, vec2(0.12, 0.74), 0.013);
+            stars += spark(spun, vec2(-0.53, -0.28), 0.012) * 0.52;
+            stars += spark(spun, vec2(0.37, -0.55), 0.012) * 0.52;
+            stars += spark(spun, vec2(0.43, 0.10), 0.011) * 0.42;
+            stars = min(stars, 1.0) * detail * 0.82;
+          }
+          float coreDistance = length(point - vec2(0.03, -0.01));
+          float corePattern = 0.5;
+          if (detail > 0.01 && coreDistance < 0.3) corePattern += 0.25 * sin(point.x * 17.0 + vSeed * 8.0) + 0.25 * sin(point.y * 14.0 - vSeed * 7.0);
+          float core = (1.0 - smoothstep(0.16, 0.24, coreDistance)) * (0.42 + corePattern * detail * 0.15);
+          core += stroke(coreDistance - 0.235, 0.014) * 0.26;
+          core += exp(-dot(point - vec2(-0.04, 0.06), point - vec2(-0.04, 0.06)) * 95.0) * 0.22;
+          float alpha = sphere * clamp(0.045 + light * 0.06 + rim + reflection + shellFill + shells + filaments + stars + core, 0.0, 0.92);
+          vec3 tint = mix(vec3(0.88, 0.93, 1.0), vColor, 0.18);
+          vec3 color = mix(tint, vec3(1.0), clamp(rim + filaments + stars + core, 0.0, 1.0) * 0.64);
+          gl_FragColor = vec4(color, alpha);
           #include <tonemapping_fragment>
           #include <colorspace_fragment>
         }
       `,
       transparent: true,
-      depthWrite: true,
+      depthWrite: false,
       side: THREE.DoubleSide,
     });
     this.nodeMesh = new THREE.InstancedMesh(geometry, material, this.items.length);
@@ -254,11 +289,11 @@ class NeuronEngine {
         varying vec3 vColor;
         void main() {
           float r = length(vCircle);
-          float atmosphere = exp(-pow((r - 0.34) * 13.0, 2.0)) * 0.17;
-          float haze = pow(max(0.0, 1.0 - r), 3.0) * 0.07;
+          float atmosphere = exp(-pow((r - 0.34) * 12.0, 2.0)) * 0.18;
+          float haze = pow(max(0.0, 1.0 - r), 3.0) * 0.045;
           float alpha = atmosphere + haze;
           if (alpha < 0.001) discard;
-          gl_FragColor = vec4(mix(vColor, vec3(0.68, 0.88, 1.0), 0.24), alpha);
+          gl_FragColor = vec4(mix(vec3(0.84, 0.9, 1.0), vColor, 0.18), alpha);
           #include <tonemapping_fragment>
           #include <colorspace_fragment>
         }
@@ -482,8 +517,8 @@ class NeuronEngine {
           float alpha = 1.0 - smoothstep(1.0 - edge, 1.0 + edge, r);
           if (alpha < 0.001) discard;
           float core = exp(-r * r * 5.0);
-          vec3 color = mix(vColor * 0.48, vec3(0.72, 1.0, 0.92), vFree * (0.48 + core * 0.32));
-          gl_FragColor = vec4(color * (0.7 + core * 0.48), alpha * (0.55 + vFree * 0.34) * mix(1.0, uReveal, vFresh));
+          vec3 color = mix(vec3(0.87, 0.93, 1.0), vColor, 0.18) * (0.78 + core * 0.25);
+          gl_FragColor = vec4(color, alpha * (0.48 + vFree * 0.20) * mix(1.0, uReveal, vFresh));
           #include <tonemapping_fragment>
           #include <colorspace_fragment>
         }
@@ -650,18 +685,24 @@ class NeuronEngine {
       .map(item => ({ item, distance: this.camera.position.distanceTo(vector(item.position)) }))
       .sort((a, b) => (a.item === selected ? -1 : b.item === selected ? 1 : a.distance - b.distance))
       .slice(0, window.innerWidth < 700 ? 18 : 36);
-    context.font = '12px system-ui, sans-serif';
     context.textAlign = 'center';
     for (const { item } of candidates) {
       const p = vector(item.position).project(this.camera);
       if (p.z < -1 || p.z > 1 || Math.abs(p.x) > 1.1 || Math.abs(p.y) > 1.1) continue;
       const x = (p.x + 1) * 0.5 * width, y = (-p.y + 1) * 0.5 * height;
+      const depth = -vector(item.position).applyMatrix4(this.camera.matrixWorldInverse).z;
+      const radius = item.scale * 0.88 * height / (2 * depth * Math.tan(THREE.MathUtils.degToRad(this.camera.fov) / 2));
+      const prominent = radius >= 70;
+      const labelY = y + Math.max(12, radius + 10);
       const label = item.title.length > 24 ? `${item.title.slice(0, 23)}…` : item.title;
-      const boxWidth = Math.min(240, context.measureText(label).width + 20);
+      context.font = `${prominent ? 16 : 12}px system-ui, sans-serif`;
+      const boxWidth = Math.min(240, Math.max(prominent ? 112 : 0, context.measureText(label).width + 20));
+      const boxHeight = prominent ? 34 : 24;
       context.fillStyle = item.id === this.selectedId ? 'rgba(5, 25, 33, .86)' : 'rgba(7, 16, 31, .76)';
-      context.beginPath(); context.roundRect(x - boxWidth / 2, y + 12, boxWidth, 24, 7); context.fill();
+      context.beginPath(); context.roundRect(x - boxWidth / 2, labelY, boxWidth, boxHeight, prominent ? 10 : 7); context.fill();
+      if (prominent) { context.strokeStyle = 'rgba(205, 221, 236, .34)'; context.lineWidth = 1; context.stroke(); }
       context.fillStyle = item.id === this.selectedId ? '#d8fff4' : '#b8ccd8';
-      context.fillText(label, x, y + 28);
+      context.fillText(label, x, labelY + (prominent ? 22 : 16));
     }
   }
 
