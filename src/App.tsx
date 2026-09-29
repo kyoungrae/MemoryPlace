@@ -244,7 +244,7 @@ export function App() {
     if (pendingLinks.current.has(linkKey)) return;
     if (connected) { setError('이미 연결된 생각입니다.'); return; }
     pendingLinks.current.add(linkKey);
-    const pending: GraphEdge = { id: `pending:${crypto.randomUUID()}`, sourceNodeId, targetNodeId, kind: 'related' };
+    const pending: GraphEdge = { id: `pending:${linkKey}`, sourceNodeId, targetNodeId, kind: 'related' };
     setGraph(previous => previous ? { ...previous, edges: [...previous.edges, pending] } : previous);
     try {
       const { edge } = await boardApi.link(boardId, sourceNodeId, targetNodeId);
