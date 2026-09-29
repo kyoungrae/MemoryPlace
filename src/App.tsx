@@ -242,7 +242,7 @@ export function App() {
     const linkKey = [sourceNodeId, targetNodeId].sort().join(':');
     const connected = current.edges.some(edge => edge.sourceNodeId === sourceNodeId && edge.targetNodeId === targetNodeId || edge.sourceNodeId === targetNodeId && edge.targetNodeId === sourceNodeId);
     if (pendingLinks.current.has(linkKey)) return;
-    if (connected) return;
+    if (connected) { setError('이미 연결된 생각입니다.'); return; }
     pendingLinks.current.add(linkKey);
     const pending: GraphEdge = { id: `pending:${crypto.randomUUID()}`, sourceNodeId, targetNodeId, kind: 'related' };
     setGraph(previous => previous ? { ...previous, edges: [...previous.edges, pending] } : previous);

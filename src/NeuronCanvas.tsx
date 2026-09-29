@@ -45,7 +45,6 @@ class NeuronEngine {
   private linkAsteroidIndex: number | null = null;
   private linkSourceId: string | null = null;
   private magnetTargetId: string | null = null;
-  private linkedTargets = new Set<string>();
   private stars: THREE.Points;
   private items: Item[] = [];
   private itemById = new Map<string, number>();
@@ -189,7 +188,7 @@ class NeuronEngine {
     this.nodeMesh = null; this.haloMesh = null; this.lineMesh = null; this.asteroidMesh = null;
     this.asteroidRevealStart = null;
     this.asteroidItems = []; this.linkAsteroidIndex = null; this.linkSourceId = null;
-    this.magnetTargetId = null; this.linkedTargets.clear();
+    this.magnetTargetId = null;
     this.clearLinkPreview();
     this.lineEndpoints.clear(); this.linePairs = [];
   }
@@ -478,17 +477,36 @@ class NeuronEngine {
     this.asteroidDegrees = degree;
     if (!this.asteroidItems.length) return;
     const geometry = new THREE.PlaneGeometry(2, 2);
+    const sourcePositions = new Float32Array(this.asteroidItems.length * 3);
+    this.asteroidItems.forEach((item, index) => {
+      const source = this.nodes.get(item.sourceId)!;
+      sourcePositions[index * 3] = source.x;
+      sourcePositions[index * 3 + 1] = source.y;
+      sourcePositions[index * 3 + 2] = source.z;
+    });
+    geometry.setAttribute('asteroidSource', new THREE.InstancedBufferAttribute(sourcePositions, 3).setUsage(THREE.DynamicDrawUsage));
     geometry.setAttribute('asteroidFresh', new THREE.InstancedBufferAttribute(new Float32Array(this.asteroidItems.map(item => item.fresh ? 1 : 0)), 1));
     const material = this.asteroidMaterial ?? new THREE.ShaderMaterial({
-      uniforms: { uReveal: { value: 1 } },
+      uniforms: { uReveal: { value: 1 }, uPixelToView: { value: 0 } },
       vertexShader: `
+        uniform float uPixelToView;
+        attribute vec3 asteroidSource;
         attribute float asteroidFresh;
         varying vec2 vCircle;
         varying vec3 vColor;
         varying float vFresh;
         void main() {
           vec4 center = modelViewMatrix * instanceMatrix * vec4(0.0, 0.0, 0.0, 1.0);
+          vec4 source = viewMatrix * vec4(asteroidSource, 1.0);
           float radius = length((instanceMatrix * vec4(1.0, 0.0, 0.0, 0.0)).xyz);
+          float pixelToView = max(0.0, -center.z) * uPixelToView;
+          vec2 separation = center.xy - source.xy;
+          float separationLength = length(separation);
+          float minimumSeparation = pixelToView * 20.0;
+          if (separationLength < minimumSeparation) {
+            center.xy = source.xy + (separationLength > 0.0001 ? separation / separationLength : vec2(1.0, 0.0)) * minimumSeparation;
+          }
+          radius = max(radius, pixelToView * 7.0);
           center.xy += position.xy * radius;
           vCircle = position.xy;
           vColor = instanceColor;
@@ -519,6 +537,8 @@ class NeuronEngine {
       side: THREE.DoubleSide,
     });
     this.asteroidMaterial = material;
+    const height = this.canvas.parentElement?.getBoundingClientRect().height || 1;
+    material.uniforms.uPixelToView.value = 2 * Math.tan(THREE.MathUtils.degToRad(this.camera.fov) / 2) / height;
     this.asteroidRevealStart = this.asteroidItems.some(item => item.fresh) ? performance.now() : null;
     material.uniforms.uReveal.value = this.asteroidRevealStart === null ? 1 : 0;
     const mesh = new THREE.InstancedMesh(geometry, material, this.asteroidItems.length);
@@ -621,9 +641,13 @@ class NeuronEngine {
       if (this.haloMesh) this.haloMesh.instanceMatrix.needsUpdate = true;
     }
     if (this.asteroidMesh) {
+      const sources = this.asteroidMesh.geometry.getAttribute('asteroidSource') as THREE.InstancedBufferAttribute;
       this.asteroidItems.forEach((asteroid, asteroidIndex) => {
-        if (asteroid.sourceId === id && asteroidIndex !== this.linkAsteroidIndex) this.writeAsteroidMatrix(asteroidIndex, asteroid);
+        if (asteroid.sourceId !== id) return;
+        sources.setXYZ(asteroidIndex, node.x, node.y, node.z);
+        if (asteroidIndex !== this.linkAsteroidIndex) this.writeAsteroidMatrix(asteroidIndex, asteroid);
       });
+      sources.needsUpdate = true;
       this.asteroidMesh.instanceMatrix.needsUpdate = true;
     }
     if (this.lineMesh && this.lineEndpoints.has(id)) {
@@ -652,6 +676,7 @@ class NeuronEngine {
     this.camera.aspect = rect.width / rect.height;
     this.camera.updateProjectionMatrix();
     if (this.lineMesh) this.lineMesh.material.uniforms.uResolution.value.set(rect.width, rect.height);
+    if (this.asteroidMaterial) this.asteroidMaterial.uniforms.uPixelToView.value = 2 * Math.tan(THREE.MathUtils.degToRad(this.camera.fov) / 2) / rect.height;
     this.labels.width = Math.round(rect.width * ratio);
     this.labels.height = Math.round(rect.height * ratio);
     this.labels.style.width = `${rect.width}px`;
@@ -772,16 +797,28 @@ class NeuronEngine {
     const focal = 1 / Math.tan(THREE.MathUtils.degToRad(this.camera.fov) / 2);
     const world = new THREE.Vector3();
     const view = new THREE.Vector3();
+    const sourceView = new THREE.Vector3();
     let result: AsteroidHit | null = null;
     let nearestDepth = Infinity;
     this.asteroidItems.forEach((asteroid, index) => {
+      const source = this.nodes.get(asteroid.sourceId);
+      if (!source) return;
       this.asteroidWorldPosition(asteroid, world);
       view.copy(world).applyMatrix4(this.camera.matrixWorldInverse);
       const depth = -view.z;
       if (depth <= this.camera.near || depth >= this.camera.far || depth >= nearestDepth) return;
-      const screenX = rect.left + (1 + view.x * focal / (this.camera.aspect * depth)) * rect.width / 2;
-      const screenY = rect.top + (1 - view.y * focal / depth) * rect.height / 2;
-      const radius = Math.max(10, (this.nodes.get(asteroid.sourceId)?.scale ?? 1) * asteroid.sizeFactor * focal * rect.height * 1.25 / depth);
+      sourceView.set(source.x, source.y, source.z).applyMatrix4(this.camera.matrixWorldInverse);
+      const separationX = view.x - sourceView.x, separationY = view.y - sourceView.y;
+      const separation = Math.hypot(separationX, separationY);
+      const minimumSeparation = 40 * depth / (focal * rect.height);
+      const directionX = separation > 0.0001 ? separationX / separation : 1;
+      const directionY = separation > 0.0001 ? separationY / separation : 0;
+      const centerX = separation < minimumSeparation ? sourceView.x + directionX * minimumSeparation : view.x;
+      const centerY = separation < minimumSeparation ? sourceView.y + directionY * minimumSeparation : view.y;
+      const screenX = rect.left + (1 + centerX * focal / (this.camera.aspect * depth)) * rect.width / 2;
+      const screenY = rect.top + (1 - centerY * focal / depth) * rect.height / 2;
+      const renderedRadius = source.scale * asteroid.sizeFactor * focal * rect.height / (2 * depth);
+      const radius = Math.max(window.innerWidth < 700 ? 22 : 18, renderedRadius * 1.4);
       if (Math.hypot(screenX - x, screenY - y) <= radius) {
         result = { asteroid, index };
         nearestDepth = depth;
@@ -797,7 +834,7 @@ class NeuronEngine {
     let nearest: MagneticTarget | null = null;
     let nearestScore = Infinity;
     for (const item of this.items) {
-      if (!item.node || item.id === sourceId || this.linkedTargets.has(item.id)) continue;
+      if (!item.node || item.id === sourceId) continue;
       view.set(item.position.x, item.position.y, item.position.z).applyMatrix4(this.camera.matrixWorldInverse);
       const depth = -view.z;
       if (depth <= this.camera.near || depth >= this.camera.far) continue;
@@ -835,11 +872,6 @@ class NeuronEngine {
     this.dragId = null;
     this.linkAsteroidIndex = hit.index;
     this.linkSourceId = hit.asteroid.sourceId;
-    this.linkedTargets.clear();
-    for (const edge of this.graph.edges) {
-      if (edge.sourceNodeId === hit.asteroid.sourceId) this.linkedTargets.add(edge.targetNodeId);
-      else if (edge.targetNodeId === hit.asteroid.sourceId) this.linkedTargets.add(edge.sourceNodeId);
-    }
     this.selectedId = hit.asteroid.sourceId;
     this.refreshColors();
     this.refreshLineColors();
@@ -872,11 +904,10 @@ class NeuronEngine {
   private finishLinkDrag(x: number, y: number, shouldLink: boolean) {
     const sourceId = this.linkSourceId;
     const target = sourceId && shouldLink ? this.pickMagneticTarget(sourceId, x, y)?.item ?? this.pick(x, y) : null;
-    const canLink = !!sourceId && !!target?.node && target.id !== sourceId && !this.linkedTargets.has(target.id);
+    const canLink = !!sourceId && !!target?.node && target.id !== sourceId;
     this.linkAsteroidIndex = null;
     this.linkSourceId = null;
     this.magnetTargetId = null;
-    this.linkedTargets.clear();
     this.clearLinkPreview();
     this.buildAsteroids();
     this.refreshColors();
@@ -887,7 +918,7 @@ class NeuronEngine {
   private onPointerDown = (event: PointerEvent) => {
     this.canvas.setPointerCapture(event.pointerId);
     const hit = this.pick(event.clientX, event.clientY);
-    const asteroidHit = event.ctrlKey ? null : this.pickAsteroid(event.clientX, event.clientY);
+    const asteroidHit = event.ctrlKey || this.linking ? null : this.pickAsteroid(event.clientX, event.clientY);
     this.pointers.set(event.pointerId, { x: event.clientX, y: event.clientY, sx: event.clientX, sy: event.clientY, hitId: asteroidHit?.asteroid.sourceId ?? hit?.id ?? null });
     this.pointerActive = true;
     if (this.pointers.size === 2) {
