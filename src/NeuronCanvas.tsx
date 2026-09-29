@@ -205,24 +205,35 @@ class NeuronEngine {
       }
     `;
     const geometry = new THREE.PlaneGeometry(2, 2);
+    geometry.setAttribute('planetSeed', new THREE.InstancedBufferAttribute(new Float32Array(this.items.map(item => (hash(item.id) % 997) / 997)), 1));
     const material = new THREE.ShaderMaterial({
-      vertexShader: `varying vec3 vColor; ${circleVertex.replace('vCircle = position.xy;', 'vCircle = position.xy; vColor = instanceColor;')}`,
+      vertexShader: `attribute float planetSeed; varying vec3 vColor; varying float vSeed; ${circleVertex.replace('vCircle = position.xy;', 'vCircle = position.xy; vColor = instanceColor; vSeed = planetSeed;')}`,
       fragmentShader: `
         varying vec2 vCircle;
         varying vec3 vColor;
+        varying float vSeed;
         void main() {
           float r = length(vCircle);
           float edge = max(fwidth(r), 0.001);
           float alpha = 1.0 - smoothstep(1.0 - edge, 1.0 + edge, r);
           if (alpha < 0.001) discard;
-          float dome = sqrt(max(0.0, 1.0 - min(r, 1.0) * min(r, 1.0)));
-          float angle = atan(vCircle.y, vCircle.x);
-          float currents = 0.5 + 0.5 * sin(angle * 5.0 + r * 15.0);
-          float core = exp(-r * r * 7.0);
-          vec3 deep = mix(vColor * 0.18, vec3(0.07, 0.15, 0.25), 0.42);
-          vec3 plasma = mix(vColor, vec3(0.45, 0.78, 1.0), 0.18 + currents * 0.16);
-          vec3 color = mix(deep, plasma, 0.42 + dome * 0.36 + core * 0.22);
-          gl_FragColor = vec4(color, alpha * (0.58 + dome * 0.3));
+          vec3 normal = normalize(vec3(vCircle, sqrt(max(0.0, 1.0 - min(r, 1.0) * min(r, 1.0)))));
+          vec3 light = normalize(vec3(-0.58, 0.72, 0.68));
+          float facing = dot(normal, light);
+          float daylight = smoothstep(-0.35, 0.65, facing);
+          float latitude = normal.y + sin(normal.x * 3.4 + vSeed * 6.0) * 0.09;
+          float bands = 0.5 + 0.5 * sin(latitude * 9.0 + vSeed * 2.4);
+          float clouds = sin(normal.x * 4.2 + sin(normal.y * 3.0 + vSeed * 6.3) * 1.1) * 0.65;
+          clouds += sin(normal.y * 5.1 + normal.z * 2.8 + vSeed * 4.2) * 0.35;
+          float surface = smoothstep(-0.45, 0.85, clouds);
+          vec3 albedo = mix(vColor * 0.56, vColor * 0.88, surface * 0.75 + bands * 0.20);
+          albedo = mix(albedo, mix(vColor, vec3(0.94, 0.97, 1.0), 0.12), bands * 0.11);
+          vec3 color = albedo * (0.20 + 0.84 * daylight);
+          float glint = pow(max(dot(reflect(-light, normal), vec3(0.0, 0.0, 1.0)), 0.0), 24.0);
+          color += vec3(0.84, 0.94, 1.0) * glint * 0.09;
+          float atmosphere = pow(1.0 - normal.z, 2.5);
+          color += mix(vColor, vec3(0.65, 0.86, 1.0), 0.32) * atmosphere * 0.28;
+          gl_FragColor = vec4(color, alpha * (0.84 + normal.z * 0.10));
           #include <tonemapping_fragment>
           #include <colorspace_fragment>
         }
@@ -243,9 +254,11 @@ class NeuronEngine {
         varying vec3 vColor;
         void main() {
           float r = length(vCircle);
-          float alpha = (1.0 - smoothstep(0.0, 1.0, r)) * 0.16;
+          float atmosphere = exp(-pow((r - 0.34) * 13.0, 2.0)) * 0.17;
+          float haze = pow(max(0.0, 1.0 - r), 3.0) * 0.07;
+          float alpha = atmosphere + haze;
           if (alpha < 0.001) discard;
-          gl_FragColor = vec4(mix(vColor, vec3(0.35, 0.84, 0.96), 0.28), alpha);
+          gl_FragColor = vec4(mix(vColor, vec3(0.68, 0.88, 1.0), 0.24), alpha);
           #include <tonemapping_fragment>
           #include <colorspace_fragment>
         }
