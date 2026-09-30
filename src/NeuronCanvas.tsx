@@ -965,14 +965,14 @@ class NeuronEngine {
       return;
     }
     if (hit?.node) {
-      const anchor = this.projectedNode(hit.id) ?? { x: event.clientX, y: event.clientY };
-      if (this.linking) { this.mode = null; this.callbacks.onSelect(hit.id, anchor); return; }
+      if (this.linking) {
+        const anchor = this.projectedNode(hit.id) ?? { x: event.clientX, y: event.clientY };
+        this.mode = null;
+        this.callbacks.onSelect(hit.id, anchor);
+        return;
+      }
       this.dragId = hit.id;
       this.mode = 'drag';
-      this.selectedId = hit.id;
-      this.refreshColors();
-      this.refreshLineColors();
-      this.callbacks.onSelect(hit.id, anchor);
       this.dragPlane.setFromNormalAndCoplanarPoint(this.camera.getWorldDirection(new THREE.Vector3()), vector(hit.position));
       const point = this.pointOnPlane(event.clientX, event.clientY);
       this.dragOffset.copy(point ? vector(hit.position).sub(point) : new THREE.Vector3());
@@ -1028,6 +1028,7 @@ class NeuronEngine {
     const pointer = this.pointers.get(event.pointerId);
     if (!pointer) return;
     const wasLinkDrag = this.mode === 'linkDrag';
+    const clickedNodeId = this.mode === 'drag' && !this.moved && event.type === 'pointerup' && this.pointers.size === 1 ? this.dragId : null;
     const backgroundClick = event.type === 'pointerup' && this.pointers.size === 1 && !this.moved && !pointer.hitId && !wasLinkDrag;
     if (wasLinkDrag) {
       const finishX = event.type === 'pointerup' ? event.clientX : pointer.x;
@@ -1040,6 +1041,13 @@ class NeuronEngine {
     if (this.mode === 'drag' && this.dragId && this.moved && !this.linking) {
       const node = this.nodes.get(this.dragId);
       if (node) this.callbacks.onCommit({ ...node });
+    }
+    if (clickedNodeId) {
+      this.selectedId = clickedNodeId;
+      this.refreshColors();
+      this.refreshLineColors();
+      this.refreshAsteroidColors();
+      this.callbacks.onSelect(clickedNodeId, this.projectedNode(clickedNodeId) ?? { x: event.clientX, y: event.clientY });
     }
     if (this.mode === 'pinchNode' && this.selectedId) {
       const node = this.nodes.get(this.selectedId);
