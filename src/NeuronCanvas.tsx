@@ -709,6 +709,22 @@ class NeuronEngine {
     this.camera.updateMatrixWorld();
   }
 
+  private wrapLabel(text: string, maxWidth: number) {
+    const lines: string[] = [];
+    for (const paragraph of (text.trim() || '제목 없음').split(/\r?\n/)) {
+      let line = '';
+      for (const character of paragraph) {
+        const next = line + character;
+        if (line && this.labelContext.measureText(next).width > maxWidth) {
+          lines.push(line.trimEnd());
+          line = character === ' ' ? '' : character;
+        } else line = next;
+      }
+      lines.push(line || ' ');
+    }
+    return lines;
+  }
+
   private drawLabels() {
     const context = this.labelContext;
     const width = this.labels.clientWidth, height = this.labels.clientHeight;
@@ -727,15 +743,19 @@ class NeuronEngine {
       const radius = item.scale * 0.88 * height / (2 * depth * Math.tan(THREE.MathUtils.degToRad(this.camera.fov) / 2));
       const prominent = radius >= 70;
       const labelY = y + Math.max(12, radius + 10);
-      const label = item.title.length > 24 ? `${item.title.slice(0, 23)}…` : item.title;
       context.font = `${prominent ? 16 : 12}px system-ui, sans-serif`;
-      const boxWidth = Math.min(240, Math.max(prominent ? 112 : 0, context.measureText(label).width + 20));
-      const boxHeight = prominent ? 34 : 24;
+      const maxTextWidth = prominent ? 220 : 170;
+      const lines = this.wrapLabel(item.title, maxTextWidth);
+      const lineHeight = prominent ? 21 : 16;
+      const paddingY = prominent ? 8 : 5;
+      const boxWidth = Math.max(prominent ? 112 : 0, ...lines.map(line => context.measureText(line).width + 20));
+      const boxHeight = lines.length * lineHeight + paddingY * 2;
       context.fillStyle = item.id === this.selectedId ? 'rgba(5, 25, 33, .86)' : 'rgba(7, 16, 31, .76)';
       context.beginPath(); context.roundRect(x - boxWidth / 2, labelY, boxWidth, boxHeight, prominent ? 10 : 7); context.fill();
       if (prominent) { context.strokeStyle = 'rgba(205, 221, 236, .34)'; context.lineWidth = 1; context.stroke(); }
       context.fillStyle = item.id === this.selectedId ? '#d8fff4' : '#b8ccd8';
-      context.fillText(label, x, labelY + (prominent ? 22 : 16));
+      context.textBaseline = 'middle';
+      lines.forEach((line, index) => context.fillText(line, x, labelY + paddingY + lineHeight * (index + 0.5)));
     }
   }
 
