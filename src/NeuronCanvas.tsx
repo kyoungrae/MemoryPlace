@@ -518,11 +518,11 @@ class NeuronEngine {
           float pixelToView = max(0.0, -center.z) * uPixelToView;
           vec2 separation = center.xy - source.xy;
           float separationLength = length(separation);
-          float minimumSeparation = pixelToView * 20.0;
+          float minimumSeparation = pixelToView * 14.0;
           if (separationLength < minimumSeparation) {
             center.xy = source.xy + (separationLength > 0.0001 ? separation / separationLength : vec2(1.0, 0.0)) * minimumSeparation;
           }
-          radius = max(radius, pixelToView * 7.0);
+          radius = max(radius, pixelToView * 3.25);
           center.xy += position.xy * radius;
           vCircle = position.xy;
           vColor = instanceColor;
