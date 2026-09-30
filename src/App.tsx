@@ -85,7 +85,6 @@ export function App() {
   const pendingMoves = useRef(new Map<string, GraphNode>());
   const activeMoves = useRef(new Set<string>());
   const pendingLinks = useRef(new Set<string>());
-  const workerRef = useRef<Worker | null>(null);
 
   useEffect(() => { graphRef.current = graph; }, [graph]);
   useEffect(() => { noteRef.current = note; }, [note]);
@@ -113,11 +112,6 @@ export function App() {
     return () => clearTimeout(timer);
   }, [panel?.nodeId, panel?.phase]);
   useEffect(() => { authApi.me().then(result => setUser(result.user)).catch(() => {}).finally(() => setBooting(false)); }, []);
-  useEffect(() => {
-    const worker = new Worker(new URL('./layout.worker.ts', import.meta.url), { type: 'module' });
-    workerRef.current = worker;
-    return () => worker.terminate();
-  }, []);
   useEffect(() => {
     if (!user || user.mustChangePassword) return;
     boardApi.list().then(result => {
@@ -310,20 +304,13 @@ export function App() {
   const createNote = async () => {
     if (!boardId || !graph) return;
     const near = graph.nodes.find(node => node.id === selectedId);
-    const angle = Math.random() * Math.PI * 2;
-    const position = near ? { x: near.x + Math.cos(angle) * 15, y: near.y + Math.sin(angle) * 12, z: near.z + (Math.random() - 0.5) * 8 } : { x: 0, y: 0, z: 0 };
+    const position = { ...graph.board.cameraState.target };
     try {
       if (noteRef.current && (saveStatus === 'dirty' || saveStatus === 'offline')) void saveDraft();
       const result = await boardApi.createNote(boardId, '새 메모', position, near?.id);
       setGraph(previous => previous ? { ...previous, nodes: [result.node, ...previous.nodes], edges: result.edge ? [...previous.edges, result.edge] : previous.edges, totalNodes: previous.totalNodes + 1 } : previous);
       showPanel(result.node.id);
       setSelectedId(result.node.id); noteRef.current = result.note; setNote(result.note); setSaveStatus('saved'); setMode('neuron'); setLinking(false); setSidebarOpen(false);
-      if (workerRef.current) {
-        workerRef.current.onmessage = (event: MessageEvent<{ id: string; position: { x: number; y: number; z: number } }>) => {
-          if (event.data.id === result.node.id) commitNode({ ...result.node, ...event.data.position });
-        };
-        workerRef.current.postMessage({ nodes: [...graph.nodes, result.node], edges: result.edge ? [...graph.edges, result.edge] : graph.edges, movingId: result.node.id });
-      }
     } catch (cause) { setError(cause instanceof Error ? cause.message : '메모를 만들지 못했습니다.'); }
   };
 
@@ -409,7 +396,6 @@ export function App() {
     try {
       if (saveTimer.current) clearTimeout(saveTimer.current);
       await noteApi.delete(note.id);
-      if (workerRef.current) workerRef.current.onmessage = null;
       pendingMoves.current.delete(selectedId);
       noteRef.current = null;
       setGraph(previous => previous ? { ...previous, nodes: previous.nodes.filter(node => node.id !== selectedId), edges: previous.edges.filter(edge => edge.sourceNodeId !== selectedId && edge.targetNodeId !== selectedId), totalNodes: Math.max(0, previous.totalNodes - 1) } : previous);
